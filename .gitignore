@@ -1,0 +1,21 @@
+﻿# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Large data folders
+dataset/
+data/
+*.wav
+*.joblib
+*.nc
+*.grib
+
+# PNG outputs
+dashboard_preview.png
+dashboard.png
+
+# VS Code
+.vscode/
