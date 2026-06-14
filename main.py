@@ -1,35 +1,41 @@
-import os
-import sys
+"""
+main.py — Entry Point
+======================
+Launches the all-in-one live dashboard.
 
-from engine import decode_wav
+Usage
+-----
+    python main.py                  # open GUI, no file pre-loaded
+    python main.py myfile.wav       # open GUI and start decoding immediately
+    python main.py --mic            # open GUI and start microphone immediately
+"""
+
+import os, sys
 
 
 def main():
-    print("=== Morse Code Decoder ===")
+    args      = sys.argv[1:]
+    start_mic = "--mic" in args
+    pos       = [a for a in args if not a.startswith("--")]
+    wav_file  = pos[0] if pos else None
 
-    audio_file = sys.argv[1] if len(sys.argv) > 1 else "noisy_paragraph.wav"
+    # Verify the file exists before launching the window
+    if wav_file and not os.path.exists(wav_file):
+        print(f"Error: file not found — {wav_file}")
+        sys.exit(1)
 
-    if not os.path.exists(audio_file):
-        print(f"Error: {audio_file} not found.")
-        print("Usage: python main.py <audio_file.wav>")
-        return
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        print("tkinter is not available on this system.")
+        print("On Linux run:  sudo apt-get install python3-tk")
+        sys.exit(1)
 
-    # Use ML model if a trained checkpoint exists, otherwise fall back to
-    # the signal-processing engine (engine.py).
-    if os.path.exists("model_best.pt"):
-        try:
-            from inference import decode_wav_ml
-            print(f"ML model -> {audio_file}")
-            result = decode_wav_ml(audio_file)
-        except Exception as e:
-            print(f"ML model failed ({e}), falling back to signal processing...")
-            result = decode_wav(audio_file)
-    else:
-        print(f"Signal processing -> {audio_file}")
-        print("Tip: run generate_dataset.py then train.py to enable the ML model.")
-        result = decode_wav(audio_file)
-
-    print(f"\nDecoded:\n{'-' * 20}\n{result}\n{'-' * 20}")
+    from ui import DecoderUI
+    app = DecoderUI(initial_file=wav_file)
+    if start_mic:
+        app._root.after(400, app._start_mic)
+    app.run()
 
 
 if __name__ == "__main__":
