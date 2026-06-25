@@ -1,0 +1,12 @@
+# Core signal processing
+numpy
+scipy
+matplotlib
+
+# Machine learning path (optional — only needed for train.py / inference.py)
+torch
+torchaudio
+
+# Live audio input
+sounddevice          # microphone capture (cross-platform)
+pyaudiowpatch        # WASAPI loopback for system audio (Windows only)
