@@ -6,7 +6,7 @@ from scipy.io import wavfile
 from src.audio_input import AudioInput, _SD_AVAILABLE, _PAW_AVAILABLE
 
 SR = 8000
-TEST_AUDIO = os.path.join(os.path.dirname(__file__), '..', 'data', 'test_audio')
+TEST_AUDIO = os.path.join(os.path.dirname(__file__), '..', 'data', 'test')
 
 
 class TestAudioInputInit(unittest.TestCase):
@@ -89,9 +89,9 @@ class TestResample(unittest.TestCase):
 class TestStreamFile(unittest.TestCase):
 
     def test_streams_wav_file(self):
-        wav_path = os.path.join(TEST_AUDIO, 'test_sos.wav')
+        wav_path = os.path.join(TEST_AUDIO, 'WHO.wav')
         if not os.path.exists(wav_path):
-            self.skipTest('test_sos.wav not found in data/test_audio/')
+            self.skipTest('WHO.wav not found in data/test/')
         chunks = []
         ai = AudioInput()
         ai.register_callback(lambda s, r: chunks.append(s.copy()))
@@ -99,9 +99,9 @@ class TestStreamFile(unittest.TestCase):
         self.assertGreater(len(chunks), 0)
 
     def test_chunks_are_numpy_arrays(self):
-        wav_path = os.path.join(TEST_AUDIO, 'test_sos.wav')
+        wav_path = os.path.join(TEST_AUDIO, 'WHO.wav')
         if not os.path.exists(wav_path):
-            self.skipTest('test_sos.wav not found in data/test_audio/')
+            self.skipTest('WHO.wav not found in data/test/')
         chunks = []
         ai = AudioInput()
         ai.register_callback(lambda s, r: chunks.append(s))

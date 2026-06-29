@@ -5,3 +5,4 @@ torchaudio
 pydub
 matplotlib
 sounddevice
+pytest

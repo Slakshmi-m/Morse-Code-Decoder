@@ -6,7 +6,7 @@ from scipy.io import wavfile
 from src.engine import MorseEngine, decode_wav
 
 SR = 8000
-TEST_AUDIO = os.path.join(os.path.dirname(__file__), '..', 'data', 'test_audio')
+TEST_AUDIO = os.path.join(os.path.dirname(__file__), '..', 'data', 'test')
 
 
 def _sine_wave(freq=700, duration=1.0, sr=SR, amplitude=16384):
@@ -65,19 +65,19 @@ class TestMorseEngineDecode(unittest.TestCase):
         result = engine.decode()
         self.assertIn('CQ', result)
 
-    def test_decode_sos(self):
-        wav_path = os.path.join(TEST_AUDIO, 'test_sos.wav')
+    def test_decode_who(self):
+        wav_path = os.path.join(TEST_AUDIO, 'WHO.wav')
         if not os.path.exists(wav_path):
-            self.skipTest('test_sos.wav not found in data/test_audio/')
+            self.skipTest('WHO.wav not found in data/test/')
         result = decode_wav(wav_path)
-        self.assertIn('SOS', result)
+        self.assertEqual(result.replace(' ', ''), 'WHO')
 
-    def test_decode_hello(self):
-        wav_path = os.path.join(TEST_AUDIO, 'test_hello.wav')
+    def test_decode_radio(self):
+        wav_path = os.path.join(TEST_AUDIO, 'RADIO METER AND.wav')
         if not os.path.exists(wav_path):
-            self.skipTest('test_hello.wav not found in data/test_audio/')
+            self.skipTest('RADIO METER AND.wav not found in data/test/')
         result = decode_wav(wav_path)
-        self.assertIn('HELLO', result)
+        self.assertIn('RADIO', result)
 
     def test_decode_returns_string(self):
         audio  = _morse_audio('CQ', wpm=20, freq=800)
@@ -92,9 +92,9 @@ class TestDecodeWavHelper(unittest.TestCase):
         self.assertIn('Error', result)
 
     def test_valid_wav_returns_string(self):
-        wav_path = os.path.join(TEST_AUDIO, 'test_sos.wav')
+        wav_path = os.path.join(TEST_AUDIO, 'WHO.wav')
         if not os.path.exists(wav_path):
-            self.skipTest('test_sos.wav not found in data/test_audio/')
+            self.skipTest('WHO.wav not found in data/test/')
         result = decode_wav(wav_path)
         self.assertIsInstance(result, str)
 
