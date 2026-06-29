@@ -141,10 +141,8 @@ class StreamingDecoder:
         self._last     = ""
         self._max      = int(self.MAX_SEC * sr)
         self._last_t   = 0.0
-        from src.engine    import MorseEngine
-        from src.corrector import MorseCorrector
+        from src.engine import MorseEngine
         self._Engine   = MorseEngine
-        self._correct  = MorseCorrector().correct
 
     def push(self, samples, rate):
         self._buf = np.concatenate([self._buf, samples.astype(np.float32)])
@@ -162,8 +160,7 @@ class StreamingDecoder:
         dbuf   = self._buf[-win:].copy().astype(np.int16)
         try:
             eng  = self._Engine(self.sr, dbuf)
-            raw  = eng.decode()
-            text = self._correct(raw)
+            text = eng.decode()
             if text != self._last:
                 self.on_text(text)
                 self._last = text
