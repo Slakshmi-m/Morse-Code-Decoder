@@ -37,6 +37,7 @@ class MorseEngine:
         if len(data.shape) > 1:
             data = data[:, 0]
 
+
         self.sample_rate = sample_rate
 
         # 1. Auto-detect tone frequency
