@@ -261,7 +261,7 @@ class LivePlotter:
 
     def _redraw(self):
         buf = self._buf
-        if buf is None or len(buf) < self.sr * 0.3: return
+        if buf is None or len(buf) < self.sr * 0.1: return
         max_s = int(self.HISTORY_S * self.sr)
         disp  = buf[-max_s:] if len(buf) > max_s else buf.copy()
         pk    = np.max(np.abs(disp))
@@ -281,8 +281,8 @@ class LivePlotter:
                 self._draw_fall(norm, carrier)
                 self._wf_tick = 0
             self.canvas.draw_idle()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[LivePlotter] _redraw error: {e}")
 
     def _draw_wave(self, norm, carrier):
         ax = self.ax_wave; ax.cla()
@@ -331,16 +331,25 @@ class LivePlotter:
                                       window="hann")
         Sdb   = 10*np.log10(Sxx + 1e-12)
         fmask = (f >= self.FREQ_MIN) & (f <= self.FREQ_MAX)
-        ax.pcolormesh(t, f[fmask], Sdb[fmask], shading="gouraud", cmap="inferno",
-                      vmin=float(np.percentile(Sdb[fmask], 8)),
-                      vmax=float(np.percentile(Sdb[fmask], 99)))
-        ax.axhline(carrier, color=C_YELLOW, linewidth=1.1, linestyle="--", alpha=0.85)
-        ax.text(t[-1]*0.99, carrier+22,
-                f"{carrier:.0f} Hz", color=C_YELLOW, fontsize=7.5, ha="right", fontweight="bold")
-        ax.set_title("③ Waterfall / Spectrogram  —  Morse appears as bright horizontal stripe",
+        Sdb_f = Sdb[fmask]
+        if Sdb_f.size == 0 or len(t) < 2:
+            return
+        vmin = float(np.percentile(Sdb_f, 8))
+        vmax = float(np.percentile(Sdb_f, 99))
+        if vmin >= vmax:
+            vmax = vmin + 1.0
+        # freq on x-axis, time on y-axis
+        ax.pcolormesh(f[fmask], t, Sdb_f.T, shading="gouraud", cmap="inferno",
+                      vmin=vmin, vmax=vmax)
+        ax.axvline(carrier, color=C_YELLOW, linewidth=1.1, linestyle="--", alpha=0.85)
+        ax.text(carrier + 15, t[-1] * 0.95,
+                f"{carrier:.0f} Hz", color=C_YELLOW, fontsize=7.5,
+                ha="left", fontweight="bold")
+        ax.set_title("③ Waterfall / Spectrogram  —  Morse appears as bright vertical stripe",
                      color=C_WHITE, fontsize=8, pad=3, loc="left")
-        ax.set_xlabel("Time (s)", color=C_LABEL, fontsize=7)
-        ax.set_ylabel("Freq (Hz)", color=C_LABEL, fontsize=7)
+        ax.set_xlabel("Freq (Hz)", color=C_LABEL, fontsize=7)
+        ax.set_ylabel("Time (s)", color=C_LABEL, fontsize=7)
+        ax.set_xlim(self.FREQ_MIN, self.FREQ_MAX)
         ax.tick_params(colors=C_LABEL, labelsize=7)
 
     def _draw_binary(self, binv):
