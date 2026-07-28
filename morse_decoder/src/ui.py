@@ -38,10 +38,10 @@ try:
 except ImportError:
     _MPL_OK = False
 
-from audio_input import AudioInput
-from constants   import MORSE_MAP
-from corrector   import MorseCorrector
-from engine      import MorseEngine
+from src.audio_input import AudioInput
+from src.constants   import MORSE_MAP
+from src.corrector   import MorseCorrector
+from src.engine      import MorseEngine
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tunables

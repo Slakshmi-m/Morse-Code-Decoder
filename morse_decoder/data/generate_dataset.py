@@ -24,7 +24,7 @@ import random
 import numpy as np
 from scipy.io import wavfile
 
-from constants import MORSE_TABLE, ALL_CHARS
+from src.constants import MORSE_TABLE, ALL_CHARS
 
 SAMPLE_RATE = 8_000
 

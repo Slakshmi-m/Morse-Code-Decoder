@@ -158,7 +158,7 @@ def debug_decode() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def engine_check() -> None:
-    from engine import decode_wav
+    from src.engine import decode_wav
     result = decode_wav(OUTPUT_WAV)
     print(f"\nEngine.decode() → {result!r}")
 

@@ -23,7 +23,7 @@ import torchaudio.transforms as T
 from scipy.io import wavfile
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
-from model import BLANK_IDX, CHAR_TO_IDX, MorseDecoder, greedy_decode
+from ml.model import BLANK_IDX, CHAR_TO_IDX, MorseDecoder, greedy_decode
 
 
 class MorseDataset(Dataset):
