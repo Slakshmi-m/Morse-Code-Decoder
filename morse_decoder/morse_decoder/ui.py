@@ -495,21 +495,26 @@ class DecoderUI:
                                             nperseg=nperseg, noverlap=noverlap)
             Sxx_db = 10 * np.log10(Sxx + 1e-12)
             fm = (f_ >= 200) & (f_ <= 1500)
-            img = ax.pcolormesh(t_, f_[fm], Sxx_db[fm],
-                                shading="gouraud", cmap="inferno",
-                                vmin=float(np.percentile(Sxx_db[fm], 8)),
-                                vmax=float(np.percentile(Sxx_db[fm], 99)))
-            cf = engine.detected_freq
-            ax.axhline(cf, color=YELLOW, linewidth=1.0, linestyle="--", alpha=0.8)
-            ax.text(t_[-1] * 0.99, cf + 15,
-                    f"{cf:.0f} Hz", color=YELLOW, fontsize=7, ha="right")
-        except Exception:
-            pass
+            if np.any(fm) and len(t_) > 1:
+                z    = Sxx_db[fm]
+                vmin = float(np.percentile(z, 8))
+                vmax = float(np.percentile(z, 99))
+                if vmax <= vmin:
+                    vmax = vmin + 1.0
+                ax.pcolormesh(f_[fm], t_, z.T,
+                              shading="auto", cmap="inferno",
+                              vmin=vmin, vmax=vmax)
+                cf = engine.detected_freq
+                ax.axvline(cf, color=YELLOW, linewidth=1.0, linestyle="--", alpha=0.8)
+                ax.text(cf + 15, t_[-1] * 0.01,
+                        f"{cf:.0f} Hz", color=YELLOW, fontsize=7, ha="left", va="top")
+        except Exception as exc:
+            print(f"[UI] Waterfall error: {exc}")
         ax.set_title("③ Waterfall / Spectrogram  —  Morse = bright stripe",
                      color=WHITE, fontsize=8, loc="left", pad=3)
         ax.tick_params(colors=LABEL_COL, labelsize=7)
-        ax.set_xlabel("Time (s)",       color=LABEL_COL, fontsize=7)
-        ax.set_ylabel("Freq (Hz)",      color=LABEL_COL, fontsize=7)
+        ax.set_xlabel("Frequency (Hz)", color=LABEL_COL, fontsize=7)
+        ax.set_ylabel("Time (s)",       color=LABEL_COL, fontsize=7)
         for sp in ax.spines.values(): sp.set_color(GREY)
 
         # ── Panel 4: Binary Signal ────────────────────────────────────────────

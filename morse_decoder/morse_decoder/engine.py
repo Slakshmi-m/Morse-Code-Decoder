@@ -204,9 +204,9 @@ class MorseEngine:
         on_arr = np.array(sorted(on_durs))
         unit   = self._estimate_dit(on_durs, on_arr)
 
-        # ── Space thresholds (Assignment: "Timing Flexibility") ───────────────
-        char_space_threshold = unit * 2.5
-        word_space_threshold = unit * 5.0
+        # ── Space thresholds — adaptive clustering on OFF durations ─────────
+        char_space_threshold, word_space_threshold = \
+            self._estimate_space_thresholds(off_durs, unit)
 
         # ── Decode ────────────────────────────────────────────────────────────
         decoded_chars: list[str] = []
@@ -259,10 +259,53 @@ class MorseEngine:
                 split_val = (lower_vals[split_idx] + lower_vals[split_idx + 1]) / 2
                 if gaps[split_idx] > lower_vals[split_idx] * 0.2:
                     dits = [d for d in on_durs if d <= split_val]
-                    return float(np.mean(dits)) if dits else float(lower_vals[0])
-            return float(lower_vals[0]) if len(lower_vals) else float(on_arr[0])
+                    if dits:
+                        est = float(np.mean(dits))
+                        # Sanity: a dit must be well below the median ON duration.
+                        # If the estimate is >= 65% of median, gap-clustering split
+                        # at the wrong place (e.g. noise floor vs real signal),
+                        # so fall through to the median-split fallback below.
+                        if est < float(np.median(on_arr)) * 0.65:
+                            return est
+
+            # Fallback: median split — below-median pulses are dits.
+            # More robust than returning lower_vals[0] (which can be a noise spike).
+            median = float(np.median(on_arr))
+            dits   = on_arr[on_arr < median]
+            return float(np.mean(dits)) if len(dits) else float(on_arr[0])
 
         return float(on_arr[0]) if len(on_arr) else float(self.sample_rate * 0.08)
+
+    def _estimate_space_thresholds(self, off_durs: list[int],
+                                   unit: float) -> tuple[float, float]:
+        """
+        Return char and word space thresholds in samples.
+
+        char_space_threshold is fixed at 2.0× unit — this sits safely between
+        intra-char (1× unit) and inter-char (3× unit) for all standard and
+        Farnsworth sending styles, and must not be clustered from data because
+        a 3-cluster OFF distribution (intra / inter / word) causes the
+        largest-gap heuristic to split at the inter→word boundary instead of
+        the intra→inter boundary, silently merging all letters within a word.
+
+        word_space_threshold is found adaptively by clustering the OFF gaps
+        that are already above char_space_threshold — at that point only two
+        classes remain (inter-char and word), so largest-gap is reliable.
+        """
+        char_thresh  = unit * 2.0
+        default_word = unit * 5.0
+
+        # Only cluster gaps that are clearly above the inter-char level
+        larger = np.array(sorted(d for d in off_durs if d > char_thresh))
+        if len(larger) >= 4:
+            gaps = np.diff(larger)
+            wi   = int(np.argmax(gaps))
+            if gaps[wi] > larger[wi] * 0.3:
+                candidate = float((larger[wi] + larger[wi + 1]) / 2)
+                if candidate > char_thresh * 1.5:
+                    return float(char_thresh), candidate
+
+        return float(char_thresh), float(default_word)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

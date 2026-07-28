@@ -1,21 +1,36 @@
-﻿# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.venv/
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
 venv/
+.venv/
+env/
 
-# Large data folders
-dataset/
-data/
-*.wav
-*.joblib
-*.nc
-*.grib
+# Datasets — large audio files, do not commit
+morse_decoder/morse_decoder/dataset/
+morse_decoder/morse_decoder/ninja_dataset/
 
-# PNG outputs
-dashboard_preview.png
-dashboard.png
+# Trained model checkpoint — large binary
+morse_decoder/morse_decoder/model_best.pt
 
-# VS Code
+# Raw audio test files
+morse_decoder/*.wav
+morse_decoder/morse_decoder/*.wav
+
+# Unrelated projects in this repo root
+new/
+opcua_lab/
+morse_decoder_pipeline.docx
+
+# OS / IDE
+.DS_Store
+Thumbs.db
 .vscode/
+.idea/

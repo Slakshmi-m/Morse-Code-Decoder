@@ -31,10 +31,12 @@ fill gaps reliably even in weak-signal conditions.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import re
 from collections import defaultdict
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,8 +87,6 @@ PEAK FREQUENCY DETECTION FINDS THE TONE CARRIER
 """.upper()
 
 _EXTRA_WORDS: list[str] = [
-    # Common English high-frequency words
-    "HELLO", "FOLLOW", "FELLOW", "HOLLOW", "ALLOW",
     # Ham radio prosigns and abbreviations
     "CQ", "DE", "AR", "SK", "BK", "KN", "QRN", "QRM", "QSB", "QSO",
     "QTH", "QRZ", "RST", "TNX", "TU", "UR", "ES", "OM", "YL", "DX",
@@ -100,6 +100,15 @@ _EXTRA_WORDS: list[str] = [
     # Spelled-out numbers
     "ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE",
     "SIX", "SEVEN", "EIGHT", "NINE", "TEN",
+]
+
+# Dataset metadata files the corrector will auto-load at startup.
+# Every "text" label in these files becomes N-gram training data —
+# no need to manually add words here when the dataset already has them.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_DATASET_META_PATHS: list[str] = [
+    os.path.join(_HERE, "dataset",       "metadata.json"),
+    os.path.join(_HERE, "ninja_dataset", "metadata.json"),
 ]
 
 
@@ -128,14 +137,35 @@ class MorseCorrector:
         self._bigram:  Dict[Tuple[str, str], int]      = defaultdict(int)
         self._trigram: Dict[Tuple[str, str, str], int] = defaultdict(int)
 
-        # Train on built-in corpus
+        # Train on built-in corpus and static word list
         self._train(_CORPUS)
         for word in _EXTRA_WORDS:
             self._train(word + " ")
 
+        # Auto-load every text label from available dataset metadata files.
+        # This covers all words the Ninja/synthetic datasets contain without
+        # needing to manually maintain a word list here.
+        for meta_path in _DATASET_META_PATHS:
+            self._train_from_metadata(meta_path)
+
     # ──────────────────────────────────────────────────────────────────────────
     # Training
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _train_from_metadata(self, meta_path: str) -> None:
+        """Load every text label from a dataset metadata.json and train on it."""
+        if not os.path.exists(meta_path):
+            return
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                records = json.load(f)
+            for record in records:
+                text = record.get("text", "")
+                if text:
+                    self._train(text + " ")
+            print(f"[MorseCorrector] Loaded {len(records)} labels from {meta_path}")
+        except Exception as exc:
+            print(f"[MorseCorrector] Could not load {meta_path}: {exc}")
 
     def _train(self, text: str) -> None:
         """Count n-gram frequencies from a text string."""
@@ -231,17 +261,25 @@ class MorseCorrector:
                 i += 1
         return tokens
 
+    @staticmethod
+    def _nearest_char(tokens: list[str], i: int, step: int) -> tuple[Optional[str], int]:
+        """Walk in direction `step` from i, skipping spaces and [?]. Returns (char, pos)."""
+        j = i + step
+        while 0 <= j < len(tokens):
+            if tokens[j] not in (" ", "[?]"):
+                return tokens[j], j
+            j += step
+        return None, -1
+
     def _fill_unknowns(self, tokens: list[str]) -> list[str]:
         """Replace every '[?]' with the highest-probability character."""
         result = list(tokens)
         for i, tok in enumerate(result):
             if tok != "[?]":
                 continue
-            prev2 = result[i - 2] if i >= 2 and result[i - 2] != "[?]" else None
-            prev  = result[i - 1] if i >= 1 and result[i - 1] != "[?]" else None
-            nxt   = (result[i + 1]
-                     if i < len(result) - 1 and result[i + 1] != "[?]"
-                     else None)
+            prev,  prev_pos  = self._nearest_char(result, i,        -1)
+            prev2, _         = self._nearest_char(result, prev_pos,  -1) if prev_pos >= 0 else (None, -1)
+            nxt,   _         = self._nearest_char(result, i,         +1)
 
             best_char, best_score = "?", -math.inf
             for candidate in self.ALPHABET:
@@ -254,17 +292,19 @@ class MorseCorrector:
 
     def _fix_low_confidence(self, tokens: list[str]) -> list[str]:
         """
-        Substitute characters that are at least 50× less probable than
-        an alternative — catches common Morse confusions (E↔I, T↔M, etc.).
+        Substitute characters that are at least 20× less probable than
+        an alternative — catches common Morse confusions (E↔I, T↔M, H↔N, etc.).
+        Spaces are skipped when gathering N-gram context so that characters
+        separated by word gaps still benefit from their neighbours.
         """
-        THRESHOLD = math.log(50.0)
+        THRESHOLD = math.log(20.0)
         result = list(tokens)
         for i, tok in enumerate(result):
             if tok in ("[?]", " "):
                 continue
-            prev2 = result[i - 2] if i >= 2 else None
-            prev  = result[i - 1] if i >= 1 else None
-            nxt   = result[i + 1] if i < len(result) - 1 else None
+            prev,  prev_pos = self._nearest_char(result, i,       -1)
+            prev2, _        = self._nearest_char(result, prev_pos, -1) if prev_pos >= 0 else (None, -1)
+            nxt,   _        = self._nearest_char(result, i,        +1)
 
             current_score = self._score(prev2, prev, tok, nxt)
             for candidate in self.ALPHABET:
