@@ -94,8 +94,8 @@ def train(
         print(f"Loaded '{dataset_dir}': {len(ds)} samples")
     else:
         print(f"ERROR: {primary_meta} not found.")
-        print("Run:  python download_ninja_dataset.py   (Morse Code Ninja)")
-        print("  or: python generate_dataset.py         (synthetic)")
+        print("Run:  python -m data.download_ninja_dataset   (Morse Code Ninja)")
+        print("  or: python -m data.generate_dataset         (synthetic)")
         return
 
     if also_synthetic:
