@@ -18,7 +18,7 @@ import torch
 import torchaudio.transforms as T
 from scipy.io import wavfile
 
-from ml.model import MorseDecoder, greedy_decode
+from ml.model import MorseDecoderCNN as MorseDecoder, greedy_decode
 
 
 def decode_wav_ml(file_path: str, model_path: str = "model_best.pt",

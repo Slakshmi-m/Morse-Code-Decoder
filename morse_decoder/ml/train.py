@@ -23,7 +23,7 @@ import torchaudio.transforms as T
 from scipy.io import wavfile
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
-from ml.model import BLANK_IDX, CHAR_TO_IDX, MorseDecoder, greedy_decode
+from ml.model import BLANK_IDX, CHAR_TO_IDX, MorseDecoderCNN as MorseDecoder, greedy_decode
 
 
 class MorseDataset(Dataset):
@@ -125,6 +125,7 @@ def train(
                           collate_fn=collate, num_workers=0)
 
     model = MorseDecoder().to(device)
+    print("Model: CNN-LSTM")
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=4, factor=0.5)
     ctc   = nn.CTCLoss(blank=BLANK_IDX, reduction="mean", zero_infinity=True)
