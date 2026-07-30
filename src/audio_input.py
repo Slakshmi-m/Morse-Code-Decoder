@@ -17,7 +17,7 @@ YouTube, Spotify, any browser audio — without needing Stereo Mix at all.
 import threading, time
 from typing import Callable, List, Optional
 import numpy as np
-from scipy.io import wavfile
+from . import load_audio_file
 
 # ── sounddevice (mic + WAV) ───────────────────────────────────────────────────
 try:
@@ -184,13 +184,17 @@ class AudioInput:
             if callable(self._on_error):
                 self._on_error(str(e))
 
-    # ── WAV file ──────────────────────────────────────────────────────────────
+    # ── Audio file (WAV / MP3) ────────────────────────────────────────────────
 
     def stream_file(self, path: str, realtime=False):
         try:
-            fs, raw = wavfile.read(path)
+            fs, raw = load_audio_file(path)
         except Exception as e:
-            print(f"[AudioInput] Cannot read '{path}': {e}"); return
+            msg = f"Cannot read audio file: {e}"
+            print(f"[AudioInput] {msg}")
+            if self._on_error:
+                self._on_error(msg)
+            return
 
         if raw.ndim > 1:
             raw = raw[:, 0]

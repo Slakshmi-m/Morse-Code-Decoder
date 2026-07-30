@@ -17,8 +17,8 @@ Changes vs original:
 """
 
 import numpy as np
-from scipy.io import wavfile
 from scipy.signal import butter, lfilter, welch
+from . import load_audio_file
 from .constants import MORSE_MAP
 
 
@@ -244,9 +244,9 @@ class MorseEngine:
 
 
 def decode_wav(file_path: str) -> str:
-    """Helper — load a WAV file and decode it."""
+    """Helper — load a WAV or MP3 file and decode it."""
     try:
-        fs, data = wavfile.read(file_path)
+        fs, data = load_audio_file(file_path)
         engine   = MorseEngine(fs, data)
         return engine.decode()
     except Exception as e:
