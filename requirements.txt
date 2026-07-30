@@ -2,7 +2,7 @@ numpy
 scipy
 torch
 torchaudio
-pydub
+# MP3 support requires ffmpeg installed as a system tool: brew install ffmpeg
 matplotlib
 sounddevice
 pytest

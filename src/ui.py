@@ -24,6 +24,7 @@ import os, sys, queue, threading, time
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 from typing import Optional
+from .constants import TEXT_TO_MORSE
 
 import numpy as np
 import matplotlib
@@ -58,15 +59,6 @@ PANEL_BG  = "#181825"
 C_GREY    = "#45475A"
 C_LABEL   = "#A6ADC8"
 
-# Morse alphabet for tile display
-_MORSE = {
-    'A':'.-','B':'-...','C':'-.-.','D':'-..','E':'.','F':'..-.','G':'--.','H':'....',
-    'I':'..','J':'.---','K':'-.-','L':'.-..','M':'--','N':'-.','O':'---','P':'.--.',
-    'Q':'--.-','R':'.-.','S':'...','T':'-','U':'..-','V':'...-','W':'.--','X':'-..-',
-    'Y':'-.--','Z':'--..','0':'-----','1':'.----','2':'..---','3':'...--','4':'....-',
-    '5':'.....','6':'-....','7':'--...','8':'---..','9':'----.','.':'.-.-.-',
-    ',':'--..--','?':'..--..','=':'-...-','/':'-..-.','@':'.--.-.', ' ': '   '
-}
 
 # One colour per letter tile (cycles through accent colours)
 _TILE_COLOURS = [
@@ -450,7 +442,7 @@ class LetterTilePanel(tk.Frame):
 
         for i, ch in enumerate(chars):
             colour = _TILE_COLOURS[ord(ch) % len(_TILE_COLOURS)]
-            morse  = _MORSE.get(ch.upper(), "?")
+            morse  = TEXT_TO_MORSE.get(ch.upper(), "?")
             self._make_tile(ch.upper(), morse, colour)
 
         self._canvas.update_idletasks()
@@ -533,7 +525,7 @@ class DecoderUI:
         right = tk.Frame(bar, bg=BG2)
         right.pack(side=tk.RIGHT, padx=10, pady=6)
 
-        self._make_btn(right, "📂  Open WAV",     self._browse,       C_BLUE  ).pack(side=tk.LEFT, padx=3)
+        self._make_btn(right, "📂  Open File",     self._browse,       C_BLUE  ).pack(side=tk.LEFT, padx=3)
         self._make_btn(right, "🎙  Microphone",   self._start_mic,    C_MAUVE ).pack(side=tk.LEFT, padx=3)
         self._make_btn(right, "🔊  System Audio", self._start_system, C_GREEN ).pack(side=tk.LEFT, padx=3)
         self._make_btn(right, "⏹  Stop",          self._stop,         C_PEACH ).pack(side=tk.LEFT, padx=3)
@@ -645,8 +637,9 @@ class DecoderUI:
 
     def _browse(self):
         p = filedialog.askopenfilename(
-            title="Select a WAV file",
-            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")])
+            title="Select an audio file",
+            filetypes=[("Audio files", "*.wav *.mp3"), ("WAV files", "*.wav"),
+                       ("MP3 files", "*.mp3"), ("All files", "*.*")])
         if p: self._load_file(p)
 
     def _load_file(self, path):
@@ -692,9 +685,9 @@ class DecoderUI:
             on_status= lambda s: self._q.put(("status", s)),
             on_signal= lambda b: self._q.put(("signal", b)),
         )
+        ai._on_error = lambda m: self._q.put(("stream_error", m))
         ai.register_callback(dec.push)
         if system_audio:
-            ai._on_error = lambda m: self._q.put(("stream_error", m))
             ai.start_system_audio()
         elif mic:
             ai.start_microphone()
@@ -775,7 +768,6 @@ class DecoderUI:
 
         # morse symbols
         try:
-            from src.constants import TEXT_TO_MORSE
             syms = "  ".join(
                 TEXT_TO_MORSE.get(c, "?") if c != " " else "/"
                 for c in decoded
