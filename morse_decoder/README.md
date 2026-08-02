@@ -1,81 +1,23 @@
 # Morse Code Decoder — dev3.0
 
-A real-time Morse code decoder that listens to audio and converts beeps into text.
-This branch combines two approaches: **DSP** (live decoder, always running) and **CNN-LSTM** (neural network, experimental).
+A real-time Morse code decoder that converts audio beeps into text.  
+Built with two pipelines: **DSP** (signal processing, always live) and **CNN-LSTM** (deep learning, the main ML feature).
+
+> **For teammates:** The ML model is the primary deliverable. DSP is included as a working baseline. The UI ties both together.
 
 ---
 
-## How It Works — Big Picture
+## Quick Start
 
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Run the app
+python main.py
+
+# 3. In the UI — click "Open WAV" to decode a file, or "Microphone" for live input
 ```
-Audio Input (mic / WAV file / system audio)
-        │
-        ▼
-┌───────────────────────────────┐
-│   DSP Decoder  (src/)         │  ← Always running, produces live text
-│                               │
-│  filter → envelope →          │
-│  threshold → timing →         │
-│  Morse table → corrector      │
-└───────────────────────────────┘
-        │
-        ▼
-   Decoded Text on Screen
-
-
-(Separate, experimental path)
-
-Audio Input
-        │
-        ▼
-┌───────────────────────────────┐
-│   CNN-LSTM Model  (ml/)       │  ← Trained offline, tested on WAV files
-│                               │
-│  spectrogram → CNN →          │
-│  LSTM → CTC decode            │
-└───────────────────────────────┘
-        │
-        ▼
-   Decoded Text (printed to terminal)
-```
-
----
-
-## The Two Approaches Explained
-
-### 1. DSP — Digital Signal Processing
-> The live working decoder. No training needed.
-
-Takes raw audio and applies a chain of mathematical rules:
-
-| Step | What it does |
-|---|---|
-| Bandpass filter | Keeps only the Morse tone frequency (e.g. 700 Hz), cuts out all noise |
-| Envelope detection | Converts the tone into a smooth volume-over-time curve |
-| Thresholding | Decides: is the signal ON or OFF at each moment? |
-| Timing | Measures pulse lengths — short ON = dot, long ON = dash |
-| Morse lookup | Converts dot/dash patterns to letters (e.g. `.-` = A) |
-| N-gram corrector | Fixes misread letters using word probability statistics |
-
-No learning involved. Just maths applied to the audio signal.
-
----
-
-### 2. CNN-LSTM — Machine Learning Model
-> Trained separately. Not yet integrated into the live UI.
-
-Learns to decode Morse by studying thousands of audio examples.
-
-| Step | What it does |
-|---|---|
-| Mel spectrogram | Converts audio into a 2D image (frequency × time) |
-| CNN | Scans the image for local patterns (a tone burst = a dit or dah) |
-| LSTM | Reads CNN features left-to-right, remembers what came before |
-| CTC decode | Aligns output probabilities to characters without needing exact timing |
-
-**CNN** = Convolutional Neural Network — finds patterns in the spectrogram image.
-**LSTM** = Long Short-Term Memory — handles sequences, remembers context over time.
-**CTC** = Connectionist Temporal Classification — the training loss function that maps frame-by-frame predictions to the final text without needing precise alignment labels.
 
 ---
 
@@ -83,121 +25,158 @@ Learns to decode Morse by studying thousands of audio examples.
 
 ```
 morse_decoder/
-├── main.py                        ← Run this to start the app
 │
-├── src/                           ← DSP decoder (the live working system)
-│   ├── engine.py                  ← Core DSP: filter, threshold, timing, decode
-│   ├── corrector.py               ← N-gram probabilistic spell corrector
-│   ├── audio_input.py             ← Captures mic / system audio / WAV file
-│   ├── constants.py               ← Morse code table (A=.-, B=-..., etc.)
-│   └── ui.py                      ← Live dashboard (Tkinter + matplotlib panels)
+├── main.py                        ← Entry point — run this to launch the app
+├── model_best.pt                  ← Trained CNN-LSTM weights (saved after training)
+├── test_model.py                  ← Quick 8-word accuracy check on the saved model
+├── requirements.txt
+├── .gitignore
 │
-├── ml/                            ← CNN-LSTM neural network (experimental)
-│   ├── model.py                   ← CNN-LSTM architecture definition
-│   ├── train.py                   ← Trains the model, saves model_best.pt
-│   └── inference.py               ← Decodes a WAV file using model_best.pt
+├── dsp/                           ← DSP pipeline (signal processing decoder)
+│   ├── constants.py               ← Morse code table  (A=.-, B=-..., etc.)
+│   ├── engine.py                  ← Core DSP: bandpass filter → envelope → timing → decode
+│   ├── audio_input.py             ← Captures mic / WAV file / system audio
+│   └── corrector.py               ← N-gram spell corrector for DSP output
 │
-├── data/                          ← Dataset tools
-│   ├── generate_dataset.py        ← Generates synthetic Morse training audio
-│   └── download_ninja_dataset.py  ← Downloads real Morse Code Ninja audio
+├── ui/
+│   └── ui.py                      ← Tkinter dashboard (oscilloscope, FFT, waterfall, text tiles)
 │
-└── utils/                         ← Developer tools
+├── ml/                            ← ML pipeline (CNN-LSTM neural network)
+│   ├── model.py                   ← Network architecture: Conv1d × 3 + BiLSTM × 2 + CTC head
+│   ├── train.py                   ← Training loop — run this to train/retrain
+│   ├── inference.py               ← Loads model_best.pt and decodes a WAV file
+│   └── data/
+│       ├── generate_dataset.py    ← Generates synthetic Morse training audio
+│       └── download_ninja_dataset.py  ← (Optional) downloads real Morse audio
+│
+└── utils/
     ├── debug_morse.py             ← Step-by-step DSP trace for debugging
-    └── visualizer.py              ← Plots waveforms and spectrograms
+    └── visualizer.py              ← Waveform and spectrogram plots
 ```
 
 ---
 
-## Running the Live App (DSP)
+## How the Two Pipelines Work
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
+### Pipeline 1 — DSP (Digital Signal Processing)
 
-# Run the dashboard
-python main.py
+> Always running in the background. No training needed. Works in real time.
 
-# Open a specific WAV file
-python main.py myfile.wav
-
-# Use microphone input
-python main.py --mic
 ```
+Audio → Bandpass filter → Envelope detection → Threshold → Timing → Morse table → Text
+```
+
+| Step | What it does |
+|---|---|
+| Bandpass filter | Isolates the Morse tone (e.g. 700 Hz), cuts out noise |
+| Envelope detection | Converts the tone into a volume-over-time curve |
+| Thresholding | Decides ON / OFF at each millisecond |
+| Timing | Short ON = dot, long ON = dash; gaps → letter/word boundaries |
+| Morse table | `.-` → A, `-...` → B, etc. (defined in `dsp/constants.py`) |
+| N-gram corrector | Fixes misread characters using letter-pair statistics |
+
+**File:** `dsp/engine.py`
 
 ---
 
-## CNN-LSTM Training (ML Path)
+### Pipeline 2 — CNN-LSTM (Machine Learning) ← Main ML Feature
 
-### Step 1 — Generate training data
+> Trained on synthetic audio. Decodes WAV files using a neural network.
 
-**Option A — Synthetic dataset** (fast, no download):
-```bash
-python -m data.generate_dataset
 ```
-Generates ~8000 clean Morse audio samples with labels. Takes a few minutes.
-
-**Option B — Morse Code Ninja dataset** (real audio, ~150 MB):
-```bash
-pip install requests pydub
-winget install ffmpeg          # Windows only
-
-python -m data.download_ninja_dataset
+WAV file → Mel spectrogram → CNN (feature extractor) → BiLSTM (sequence model) → CTC decode → Text
 ```
-Downloads real Morse practice audio from Morse Code Ninja. Better quality, longer training.
+
+| Step | What it does |
+|---|---|
+| Mel spectrogram | Converts audio into a 2D frequency-vs-time image (32 mel bins, 8 kHz) |
+| Conv1d × 3 | Scans across time to extract local tone/silence patterns |
+| Bidirectional LSTM × 2 | Reads the sequence forward and backward, builds context |
+| Linear + log-softmax | Maps each time frame to a probability over 38 characters |
+| CTC decode | Collapses per-frame predictions to final text (no alignment labels needed) |
+
+**Files:** `ml/model.py`, `ml/train.py`, `ml/inference.py`
+
+**Vocabulary:** A–Z, 0–9, space = 37 characters + 1 CTC blank = 38 total  
+**Architecture:** 651,366 trainable parameters  
+**Training loss:** CTC (Connectionist Temporal Classification)
 
 ---
 
-### Step 2 — Train the CNN-LSTM
+## Training the CNN-LSTM Model
+
+### Step 1 — Generate the training dataset
 
 ```bash
-# Quick test run (10 epochs, ~15-30 min on CPU)
-python -m ml.train --epochs 10
-
-# Full training run (60 epochs, 1-3 hours on CPU)
-python -m ml.train --epochs 60
-
-# Train using Ninja dataset
-python -m ml.train --dataset ninja_dataset --epochs 10
-
-# Train using both datasets combined
-python -m ml.train --dataset ninja_dataset --also-synthetic --epochs 10
+python ml/data/generate_dataset.py
 ```
 
-Training prints loss after every epoch. Lower loss = better model.
-The best checkpoint is automatically saved to `model_best.pt`.
+Creates `dataset/` with ~3630 synthetic Morse WAV files and a `metadata.json` label file.  
+Takes about 1–2 minutes. The dataset is **not committed to git** (too large) — each teammate must generate it locally.
+
+### Step 2 — Train
+
+```bash
+python ml/train.py --epochs 35
+```
+
+- Trains for 35 epochs on CPU (~5 min/epoch → ~3 hours total)
+- Prints loss after each epoch — lower is better
+- Automatically saves the best checkpoint to `model_best.pt`
+- Runs an 8-word decode test at the end
+
+**What good training looks like:**
+```
+Epoch   1/35  train=210.4  val=198.3  ← saved
+Epoch   5/35  train=12.1   val=9.8    ← saved
+Epoch  15/35  train=0.42   val=0.31   ← saved
+Epoch  25/35  train=0.08   val=0.04   ← saved   ← good model starts here
+```
+
+Target: `val_loss < 0.1` for reliable decoding.
+
+### Step 3 — Check the model
+
+```bash
+python test_model.py
+```
+
+Runs 8 test words through the saved model and prints a score card:
+
+```
+--- Quick decode test ---
+  [OK]     expected=E      got='E'
+  [OK]     expected=SOS    got='SOS'
+  [OK]     expected=HAM    got='HAM'
+  ...
+  Score: 8/8
+  Perfect score — model is ready!
+```
+
+A score of 8/8 means the model is working well.
 
 ---
 
-### Step 3 — Test the trained model
+## Using the UI
 
 ```bash
-python -m ml.inference myfile.wav
-python -m ml.inference myfile.wav model_best.pt
+python main.py               # launch with no file
+python main.py myfile.wav    # open and decode a WAV file immediately
+python main.py --mic         # start with microphone input
 ```
 
----
+**UI layout:**
 
-## What Each File in `ml/` Does
+| Panel | What it shows |
+|---|---|
+| Left column | Live oscilloscope, FFT, waterfall, binary signal, dit-dah histogram |
+| Right column | Decoded letter tiles (large cards), Morse symbol stream, full text box |
+| Top bar | Open WAV / Microphone / System Audio / Stop / Clear |
 
-### `ml/model.py` — CNN-LSTM Architecture
-Defines the neural network. Three parts:
-- **CNN block** — three convolutional layers that scan the mel spectrogram for tone patterns
-- **LSTM block** — bidirectional LSTM that reads the sequence and builds context
-- **Output head** — linear layer that maps to character probabilities
-
-### `ml/train.py` — Training Loop
-- Loads dataset from `metadata.json`
-- Converts each audio file to a mel spectrogram
-- Feeds spectrograms through the CNN-LSTM
-- Computes CTC loss against the correct transcript
-- Adjusts model weights to reduce the loss
-- Saves the best checkpoint to `model_best.pt`
-
-### `ml/inference.py` — Inference
-- Loads `model_best.pt`
-- Converts a WAV file to a mel spectrogram
-- Runs it through the trained CNN-LSTM
-- Returns the decoded text
+When you open a WAV file:
+1. The DSP decoder runs live as the file plays
+2. After the file finishes, the ML model (`model_best.pt`) runs on the full file for a more accurate result
+3. The decoded text appears in the right panel
 
 ---
 
@@ -205,13 +184,14 @@ Defines the neural network. Three parts:
 
 | Feature | Status |
 |---|---|
-| Live audio decoding (DSP) | Working |
-| Waterfall / oscilloscope / FFT display | Working |
+| Live DSP decoding | Working |
+| CNN-LSTM ML decoding (WAV file) | Working — needs `model_best.pt` |
+| ML integrated into UI | Working |
+| Oscilloscope / FFT / waterfall display | Working |
 | N-gram corrector | Working |
 | Microphone input | Working |
 | System audio capture (WASAPI) | Windows only |
-| CNN-LSTM training | Available |
-| CNN-LSTM integrated into live UI | Not yet |
+| Spaces between words in ML output | Needs retrain with multi-word dataset |
 
 ---
 
@@ -221,6 +201,51 @@ Defines the neural network. Three parts:
 pip install -r requirements.txt
 ```
 
-Key packages: `numpy`, `scipy`, `torch`, `torchaudio`, `matplotlib`, `tkinter`
+| Package | Used for |
+|---|---|
+| `numpy`, `scipy` | DSP signal processing |
+| `matplotlib` | Live plots in UI |
+| `torch`, `torchaudio` | CNN-LSTM model and mel spectrogram |
+| `sounddevice` | Microphone input (cross-platform) |
+| `pyaudiowpatch` | System audio loopback (Windows / WASAPI) |
 
-For the Ninja dataset downloader: `requests`, `pydub` + `ffmpeg`
+> `tkinter` is part of Python's standard library. If missing on Linux: `sudo apt-get install python3-tk`
+
+---
+
+## For Teammates — What To Do First
+
+1. **Clone the repo and install dependencies:**
+   ```bash
+   git clone https://github.com/kpnair99/kern.git
+   cd kern/morse_decoder
+   pip install -r requirements.txt
+   ```
+
+2. **Generate the dataset** (required before training):
+   ```bash
+   python ml/data/generate_dataset.py
+   ```
+
+3. **Train the model** (or use the committed `model_best.pt` if already present):
+   ```bash
+   python ml/train.py --epochs 35
+   ```
+
+4. **Check the model:**
+   ```bash
+   python test_model.py
+   ```
+
+5. **Run the app:**
+   ```bash
+   python main.py
+   ```
+
+---
+
+## Known Issues
+
+- **No spaces between words** — the current dataset only has single-word samples, so the ML model never outputs a space character. Fix: retrain with multi-word phrases in the dataset.
+- **Rare-frequency WAV files** — WAV files recorded at unusual tone frequencies (below 500 Hz) may decode with lower accuracy. The training covers 500–1200 Hz.
+- **CPU training is slow** — ~5 minutes per epoch on CPU. No GPU required, just patience.
