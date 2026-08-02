@@ -190,7 +190,17 @@ class MorseEngine:
             return "[No Morse Signal Detected]"
 
         # ── Step 2: refined dit estimate using gap clustering ────────────────
-        on_arr = np.array(sorted(on_durations))
+        on_arr  = np.array(sorted(on_durations))
+        # Shortest OFF duration ≈ intra-element gap ≈ 1 unit.  Used as a
+        # fallback calibration when ON pulses are all the same length (all
+        # dahs): if shortest_on >> shortest_off, the ON pulses are dahs and
+        # shortest_off is a better unit estimate than shortest_on.
+        min_off = float(min(off_durations)) if off_durations else 0.0
+
+        def _calibrate(min_on: float) -> float:
+            if min_off > 0 and min_on > min_off * 1.8:
+                return min_off
+            return min_on
 
         if len(on_arr) >= 4:
             # Find the largest gap between consecutive sorted ON durations
@@ -205,19 +215,51 @@ class MorseEngine:
                 split_val = (lower_vals[split_idx] + lower_vals[split_idx + 1]) / 2
                 if gaps[split_idx] > lower_vals[split_idx] * 0.2:
                     dits = [d for d in on_durations if d <= split_val]
-                    unit = float(np.mean(dits)) if dits else float(lower_vals[0])
+                    unit = float(np.mean(dits)) if dits else _calibrate(float(lower_vals[0]))
                 else:
-                    # No clear gap — assume all short pulses are dits
-                    unit = float(on_arr[0])
+                    # No clear gap — all pulses are similar length (all dits or all dahs).
+                    # Use off-duration calibration to tell them apart.
+                    unit = _calibrate(float(on_arr[0]))
             else:
-                unit = float(lower_vals[0]) if len(lower_vals) else float(on_arr[0])
+                unit = _calibrate(float(lower_vals[0]) if len(lower_vals) else float(on_arr[0]))
         else:
-            # Too few pulses — use the shortest ON duration as the dit estimate
-            unit = float(on_arr[0]) if len(on_arr) else float(self.sample_rate * 0.08)
+            # Too few pulses — apply the same off-duration calibration.
+            unit = _calibrate(float(on_arr[0])) if len(on_arr) else float(self.sample_rate * 0.08)
 
         # ── Step 3: space thresholds ──────────────────────────────────────────
+        # Fixed multiples work for standard Morse but fail for Farnsworth timing
+        # (slow overall WPM, fast element speed): inter-character gaps are
+        # stretched so far that they all exceed word_space_threshold, causing
+        # every character boundary to be decoded as a word space.
+        #
+        # Detection: if the median OFF duration above char_space_threshold
+        # already exceeds the unit-based word threshold, the fixed multipliers
+        # are wrong and we cluster instead.
         char_space_threshold = unit * 2.5
         word_space_threshold = unit * 5.0
+
+        inter_symbol = [d for d in off_durations if d > char_space_threshold]
+        if len(inter_symbol) >= 1:
+            median_gap = float(np.median(inter_symbol))
+            if median_gap > word_space_threshold:
+                # Farnsworth / stretched timing detected — inter-char gaps are
+                # larger than the unit-based word threshold, so fixed multipliers
+                # are wrong.  Cluster to find the actual inter-char/inter-word
+                # split, or lift the threshold above all gaps if no split exists
+                # (single-word message).
+                inter_arr = np.array(sorted(inter_symbol))
+                if len(inter_arr) >= 2:
+                    rel_gaps  = np.diff(inter_arr) / (inter_arr[:-1] + 1e-9)
+                    if rel_gaps.max() > 0.30:
+                        split_idx = int(np.argmax(rel_gaps))
+                        word_space_threshold = float(
+                            (inter_arr[split_idx] + inter_arr[split_idx + 1]) / 2
+                        )
+                    else:
+                        word_space_threshold = float(inter_arr.max()) * 2.0
+                else:
+                    # Only one inter-symbol gap — set threshold above it.
+                    word_space_threshold = float(inter_arr[0]) * 2.0
 
         # ── Step 4: decode ────────────────────────────────────────────────────
         decoded_text  = []

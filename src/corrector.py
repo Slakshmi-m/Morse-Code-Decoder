@@ -31,9 +31,11 @@ Usage
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 
@@ -316,8 +318,19 @@ class MorseCorrector:
     # ── Construction ──────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        self._fwd.train(_CORPUS)
-        self._bwd.train(_CORPUS[::-1])
+        pairs_path = Path(__file__).parent.parent / "data" / "training" / "pairs.jsonl"
+        extra = ""
+        if pairs_path.exists():
+            targets = []
+            for line in pairs_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    targets.append(json.loads(line).get("target", ""))
+            extra = " ".join(targets)
+
+        corpus = _CORPUS + " " + extra if extra else _CORPUS
+        self._fwd.train(corpus)
+        self._bwd.train(corpus[::-1])
 
     # ── Public API ────────────────────────────────────────────────────────────
 

@@ -20,11 +20,13 @@ New in this version
   • Cleaner colour system — Catppuccin Mocha palette
 """
 
+import difflib
 import os, sys, queue, threading, time
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 from typing import Optional
 from .constants import TEXT_TO_MORSE
+from .semantic_corrector import SemanticCorrector
 
 import numpy as np
 import matplotlib
@@ -121,7 +123,7 @@ def _wpm(unit_samples, sr):
 class StreamingDecoder:
     DECODE_WINDOW_SEC = 6.0
     MIN_SEC           = 1.5
-    MAX_SEC           = 30.0
+    MAX_SEC           = 60.0
     DECODE_EVERY_SEC  = 0.4
 
     def __init__(self, sr, on_text, on_status, on_signal):
@@ -167,6 +169,19 @@ class StreamingDecoder:
             self.on_status(("live", eng.snr_db, freq, _wpm(u, self.sr)))
         except Exception as e:
             self.on_status(("error", 0, 0, 0))
+
+    def full_decode(self) -> str:
+        """Decode the entire accumulated audio buffer (up to MAX_SEC).
+        Used by the LLM layer so it sees the complete message, not just
+        the last 6-second window."""
+        if len(self._buf) < int(self.MIN_SEC * self.sr):
+            return ""
+        try:
+            buf = self._buf.copy().astype(np.int16)
+            eng = self._Engine(self.sr, buf)
+            return self._corrector.correct(eng.decode())
+        except Exception:
+            return ""
 
     def reset(self):
         self._buf  = np.array([], dtype=np.float32)
@@ -478,11 +493,13 @@ class LetterTilePanel(tk.Frame):
 class DecoderUI:
 
     def __init__(self, initial_file=None):
-        self._q           = queue.Queue()
-        self._audio_input = None
-        self._decoder     = None
-        self._plotter     = None
-        self._file        = initial_file
+        self._q            = queue.Queue()
+        self._audio_input  = None
+        self._decoder      = None
+        self._plotter      = None
+        self._file         = initial_file
+        self._llm_after_id = None
+        self._semantic     = SemanticCorrector()
 
         self._build_root()
         self._build_titlebar()
@@ -566,8 +583,8 @@ class DecoderUI:
         right.pack_propagate(False)
 
         # ── section header helper ──────────────────────────────────────────────
-        def section(parent, title):
-            tk.Label(parent, text=title, bg=BG2, fg=C_BLUE,
+        def section(parent, title, colour=C_BLUE):
+            tk.Label(parent, text=title, bg=BG2, fg=colour,
                      font=("Segoe UI", 8, "bold"),
                      padx=10, pady=4).pack(anchor=tk.W)
             tk.Frame(parent, bg=SURFACE0, height=1).pack(fill=tk.X, padx=10)
@@ -595,9 +612,21 @@ class DecoderUI:
             bg=BG3, fg=C_WHITE,
             insertbackground=C_WHITE, selectbackground=C_BLUE,
             wrap=tk.WORD, relief=tk.FLAT, padx=10, pady=8,
+            height=4, state=tk.DISABLED, borderwidth=0,
+        )
+        self._text_area.pack(fill=tk.X, padx=6, pady=(4, 0))
+
+        # ── 4. LLM verified output ─────────────────────────────────────────────
+        section(right, f"LLM VERIFIED  ({self._semantic.model})", C_TEAL)
+        self._llm_area = scrolledtext.ScrolledText(
+            right, font=("Courier New", 13),
+            bg=BG3, fg=C_SUBTEXT,
+            insertbackground=C_WHITE, selectbackground=C_BLUE,
+            wrap=tk.WORD, relief=tk.FLAT, padx=10, pady=8,
             state=tk.DISABLED, borderwidth=0,
         )
-        self._text_area.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 0))
+        self._llm_area.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 8))
+        self._show_llm_status("Start a decode to enable LLM verification…")
 
     # ── status bar ────────────────────────────────────────────────────────────
 
@@ -709,11 +738,15 @@ class DecoderUI:
         self._update_status_bar(0, 0, 0)
 
     def _clear(self):
+        if self._llm_after_id is not None:
+            self._root.after_cancel(self._llm_after_id)
+            self._llm_after_id = None
         self._tiles.update_text("")
         for area in (self._morse_area, self._text_area):
             area.config(state=tk.NORMAL)
             area.delete("1.0", tk.END)
             area.config(state=tk.DISABLED)
+        self._show_llm_status("Start a decode to enable LLM verification…")
 
     # ── queue polling ─────────────────────────────────────────────────────────
 
@@ -724,6 +757,10 @@ class DecoderUI:
                 if   kind == "text":         self._show_text(payload)
                 elif kind == "status":       self._handle_status(payload)
                 elif kind == "signal":       self._plotter.push(payload)
+                elif kind == "llm_verified": self._show_llm_verified(payload)
+                elif kind == "llm_status":
+                    c = C_RED if any(w in payload.lower() for w in ("offline", "error")) else C_YELLOW
+                    self._show_llm_status(payload, c)
                 elif kind == "stream_error": self._set_status("⚠ Stream failed"); messagebox.showerror("Audio Error", payload)
         except queue.Empty:
             pass
@@ -781,6 +818,65 @@ class DecoderUI:
         self._morse_area.insert(tk.END, syms)
         self._morse_area.see(tk.END)
         self._morse_area.config(state=tk.DISABLED)
+
+        # LLM verification debounce — fire 2.5 s after text stops changing
+        if self._llm_after_id is not None:
+            self._root.after_cancel(self._llm_after_id)
+        self._llm_after_id = self._root.after(
+            2500, lambda d=decoded, s=syms: self._trigger_llm_verify(d, s)
+        )
+
+    def _trigger_llm_verify(self, decoded: str, morse_syms: str):
+        self._llm_after_id = None
+        if not decoded or decoded.startswith("["):
+            return
+
+        # Re-decode the full audio buffer so the LLM sees the complete
+        # message, not just the last 6-second sliding window.
+        if self._decoder is not None:
+            full = self._decoder.full_decode()
+            if full and not full.startswith("["):
+                decoded = full
+                morse_syms = "  ".join(
+                    TEXT_TO_MORSE.get(c, "?") if c != " " else "/"
+                    for c in decoded
+                )
+
+        self._show_llm_status("Checking with LLM…", C_YELLOW)
+
+        dsp_text = decoded  # capture for closure
+
+        def _on_llm_result(llm_text: str) -> None:
+            ratio = difflib.SequenceMatcher(
+                None, dsp_text.upper(), llm_text.upper()
+            ).ratio()
+            if ratio < 0.75:
+                self._q.put((
+                    "llm_status",
+                    f"LLM output too different from DSP decode "
+                    f"(similarity {ratio:.0%}) — DSP result is more reliable here.",
+                ))
+            else:
+                self._q.put(("llm_verified", llm_text))
+
+        self._semantic.verify_async(
+            decoded,
+            morse_syms,
+            on_result=_on_llm_result,
+            on_error= lambda m: self._q.put(("llm_status",   m)),
+        )
+
+    def _show_llm_verified(self, text: str):
+        self._llm_area.config(state=tk.NORMAL)
+        self._llm_area.delete("1.0", tk.END)
+        self._llm_area.insert(tk.END, text)
+        self._llm_area.config(state=tk.DISABLED, fg=C_TEAL)
+
+    def _show_llm_status(self, msg: str, colour: str = C_SUBTEXT):
+        self._llm_area.config(state=tk.NORMAL, fg=colour)
+        self._llm_area.delete("1.0", tk.END)
+        self._llm_area.insert(tk.END, msg)
+        self._llm_area.config(state=tk.DISABLED)
 
     def _set_status(self, msg):
         self._status_var.set(msg)
