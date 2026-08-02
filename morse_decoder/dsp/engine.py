@@ -28,7 +28,7 @@ import numpy as np
 from scipy.io import wavfile
 from scipy.signal import butter, lfilter, welch
 
-from src.constants import MORSE_MAP
+from dsp.constants import MORSE_MAP
 
 
 class MorseEngine:

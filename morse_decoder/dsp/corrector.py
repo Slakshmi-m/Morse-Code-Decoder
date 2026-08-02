@@ -239,9 +239,11 @@ class MorseCorrector:
         if not decoded or decoded.startswith("["):
             return decoded
 
-        tokens = self._tokenise(decoded)
-        tokens = self._fill_unknowns(tokens)
-        tokens = self._fix_low_confidence(tokens)
+        tokens       = self._tokenise(decoded)
+        has_unknowns = "[?]" in tokens
+        tokens       = self._fill_unknowns(tokens)
+        if has_unknowns:
+            tokens = self._fix_low_confidence(tokens)
         return "".join(tokens)
 
     # ──────────────────────────────────────────────────────────────────────────

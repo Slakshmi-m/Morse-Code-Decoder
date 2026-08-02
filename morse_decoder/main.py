@@ -33,7 +33,7 @@ def main() -> None:
         print("On Linux, run:  sudo apt-get install python3-tk")
         sys.exit(1)
 
-    from src.ui import DecoderUI
+    from ui.ui import DecoderUI
     app = DecoderUI(initial_file=wav_file)
     if start_mic:
         app._root.after(400, app._start_mic)

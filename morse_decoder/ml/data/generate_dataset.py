@@ -20,11 +20,14 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
 from scipy.io import wavfile
 
-from src.constants import MORSE_TABLE, ALL_CHARS
+from dsp.constants import MORSE_TABLE, ALL_CHARS
 
 SAMPLE_RATE = 8_000
 
@@ -37,6 +40,7 @@ WORDS: list[str] = [
     "WORLD", "73", "88", "CW", "TNX", "AR", "SK", "QRN", "QRM", "HAM",
     "RADIO", "CALL", "SIGN", "FREQ", "BAND", "METER", "OM", "YL", "ES",
 ]
+
 
 
 def text_to_audio(text: str, wpm: int, freq: float,
@@ -98,16 +102,16 @@ def text_to_audio(text: str, wpm: int, freq: float,
     return np.clip(sig, -32767, 32767).astype(np.int16)
 
 
-def generate_dataset(output_dir: str = "dataset", n_random: int = 8_000) -> None:
+def generate_dataset(output_dir: str = "dataset", n_random: int = 3000) -> None:
     audio_dir = os.path.join(output_dir, "audio")
     os.makedirs(audio_dir, exist_ok=True)
 
     samples: list[dict] = []
 
-    # ── Guaranteed coverage: every char × 6 WPM × 2 freq ────────────────────
+    # ── Guaranteed coverage: every char × 5 WPM × 3 freq ────────────────────
     for char in ALL_CHARS:
-        for wpm in [5, 10, 15, 20, 25, 35]:
-            for freq in [600, 800]:
+        for wpm in [15, 20, 25, 30, 35]:
+            for freq in [600, 800, 1070]:
                 samples.append(dict(
                     text=char, wpm=wpm, freq=float(freq),
                     noise=random.uniform(0.0, 0.12), fw=0,
@@ -115,23 +119,21 @@ def generate_dataset(output_dir: str = "dataset", n_random: int = 8_000) -> None
 
     # ── Random samples ────────────────────────────────────────────────────────
     for _ in range(n_random):
-        wpm  = random.randint(5, 35)
+        wpm  = random.randint(15, 35)   # min 15 WPM keeps audio short
         roll = random.random()
 
-        if roll < 0.20:
+        if roll < 0.30:
             text = random.choice(ALL_CHARS)
-        elif roll < 0.40:
+        elif roll < 0.60:
             text = "".join(random.choices(ALL_CHARS[:36], k=random.randint(2, 5)))
-        elif roll < 0.70:
-            text = random.choice(WORDS)
         else:
-            text = " ".join(random.choices(WORDS, k=random.randint(2, 3)))
+            text = random.choice(WORDS)
 
-        fw = random.choice([0, 18, 20]) if wpm < 18 else 0
+        fw = 0
         samples.append(dict(
             text=text,
             wpm=wpm,
-            freq=random.uniform(400, 1100),
+            freq=random.uniform(400, 1200),
             noise=random.uniform(0.0, 0.25),
             fw=fw,
         ))

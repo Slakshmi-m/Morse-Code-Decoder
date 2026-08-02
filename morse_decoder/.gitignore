@@ -1,0 +1,20 @@
+# Generated dataset — too large to commit, regenerate with ml/data/generate_dataset.py
+dataset/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude AI session files
+.claude/
+
+# Training log files
+train_*.txt
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db

@@ -78,7 +78,8 @@ class AudioInput:
         self._callbacks: List[ChunkCallback] = []
         self._running  = False
         self._thread: Optional[threading.Thread] = None
-        self._on_error: Optional[Callable[[str], None]] = None
+        self._on_error:    Optional[Callable[[str], None]] = None
+        self._on_complete: Optional[Callable[[], None]]    = None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Callback management
@@ -239,6 +240,8 @@ class AudioInput:
             if realtime:
                 time.sleep(self.chunk_duration)
         self._running = False
+        if callable(self._on_complete):
+            self._on_complete()
 
     def stream_file_async(self, path: str, realtime: bool = True) -> None:
         """Non-blocking version of stream_file()."""

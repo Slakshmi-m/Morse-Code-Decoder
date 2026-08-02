@@ -38,10 +38,12 @@ try:
 except ImportError:
     _MPL_OK = False
 
-from src.audio_input import AudioInput
-from src.constants   import MORSE_MAP
-from src.corrector   import MorseCorrector
-from src.engine      import MorseEngine
+import threading
+
+from dsp.audio_input import AudioInput
+from dsp.constants   import MORSE_MAP, TEXT_TO_MORSE
+from dsp.corrector   import MorseCorrector
+from dsp.engine      import MorseEngine
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tunables
@@ -89,6 +91,10 @@ class DecoderUI:
         self._full_text   = ""
         self._running     = False
         self._source_label= tk.StringVar(value="—")
+        self._decode_mode    = tk.StringVar(value="DSP")
+        self._ml_pending     = False
+        self._file_mode      = False
+        self._last_file_path: Optional[str] = None
 
         # Register audio callback (thread-safe via queue)
         self._audio.register_callback(self._on_audio_chunk)
@@ -139,6 +145,18 @@ class DecoderUI:
         src = tk.Label(bar, textvariable=self._source_label,
                        bg=PANEL_BG, fg=CYAN, font=("Consolas", 9))
         src.pack(side=tk.RIGHT, padx=14)
+
+        # ML / DSP mode toggle
+        mode_frame = tk.Frame(bar, bg=PANEL_BG)
+        mode_frame.pack(side=tk.RIGHT, padx=10)
+        tk.Label(mode_frame, text="Mode:", bg=PANEL_BG, fg=LABEL_COL,
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+        for mode, col in [("DSP", ACCENT), ("ML", CYAN)]:
+            tk.Radiobutton(mode_frame, text=mode, variable=self._decode_mode,
+                           value=mode, bg=PANEL_BG, fg=col,
+                           selectcolor=PANEL_BG, activebackground=PANEL_BG,
+                           font=("Consolas", 8, "bold")
+                           ).pack(side=tk.LEFT, padx=4)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Main area: left = plots, right = decoded text
@@ -278,13 +296,17 @@ class DecoderUI:
     def _open_file(self, path: str) -> None:
         self._stop()
         self._clear()
+        self._file_mode      = True
+        self._last_file_path = path
         self._source_label.set(f"▶ WAV: {path.split('/')[-1]}")
         self._running = True
+        self._audio._on_complete = lambda: self._root.after(0, self._on_audio_file_done)
         self._audio.stream_file_async(path, realtime=True)
 
     def _start_mic(self) -> None:
         self._stop()
         self._clear()
+        self._file_mode = False
         try:
             self._audio.start_microphone()
             self._running = True
@@ -295,6 +317,7 @@ class DecoderUI:
     def _start_system_audio(self) -> None:
         self._stop()
         self._clear()
+        self._file_mode = False
         try:
             label = self._audio.start_system_audio()
             self._running = True
@@ -310,7 +333,8 @@ class DecoderUI:
                 messagebox.showerror("System Audio Error", str(exc))
 
     def _stop(self) -> None:
-        self._running = False
+        self._running   = False
+        self._file_mode = False
         self._audio.stop()
         self._source_label.set("■ Stopped")
 
@@ -349,15 +373,16 @@ class DecoderUI:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _refresh(self) -> None:
-        # Drain the thread-safe queue into the rolling buffer
+        new_data = False
         while not self._chunk_q.empty():
             chunk = self._chunk_q.get_nowait()
             self._buffer = np.concatenate([self._buffer, chunk])
+            new_data = True
 
         if len(self._buffer) > self._buf_max:
             self._buffer = self._buffer[-self._buf_max:]
 
-        if len(self._buffer) > SAMPLE_RATE // 2:   # at least 0.5 s
+        if new_data and len(self._buffer) > SAMPLE_RATE // 2:
             self._decode_and_update()
 
         self._root.after(REFRESH_MS, self._refresh)
@@ -368,6 +393,22 @@ class DecoderUI:
 
     def _decode_and_update(self) -> None:
         data = self._buffer.copy()
+
+        if self._decode_mode.get() == "ML":
+            if not self._file_mode and not self._ml_pending:
+                self._ml_pending = True
+                threading.Thread(target=self._run_ml_inference,
+                                 args=(data,), daemon=True).start()
+            # Still update plots using DSP engine (no text output)
+            if _MPL_OK:
+                try:
+                    engine = MorseEngine(SAMPLE_RATE, data)
+                    engine.decode()
+                    self._update_plots(data, engine)
+                except Exception:
+                    pass
+            return
+
         try:
             engine   = MorseEngine(SAMPLE_RATE, data)
             raw_text = engine.decode()
@@ -376,20 +417,58 @@ class DecoderUI:
             print(f"[UI] Engine error: {exc}")
             return
 
-        # Probabilistic correction
         if raw_text and not raw_text.startswith("["):
             corrected = self._corrector.correct(raw_text)
         else:
             corrected = raw_text
 
         self._snr_var.set(f"SNR: {snr:.1f} dB")
-
-        # Update right panel
         self._update_right_panel(corrected)
-
-        # Update plots
         if _MPL_OK:
             self._update_plots(data, engine)
+
+    def _run_ml_inference(self, data: np.ndarray) -> None:
+        try:
+            from ml.inference import decode_buffer_ml
+            result = decode_buffer_ml(data, sr=SAMPLE_RATE)
+        except Exception as exc:
+            result = f"[ML error: {exc}]"
+        finally:
+            self._ml_pending = False
+        if result and not result.startswith("["):
+            self._root.after(0, lambda r=result: self._update_right_panel(r))
+        elif result and result.startswith("["):
+            self._root.after(0, lambda r=result: self._snr_var.set(r[:60]))
+
+    def _on_audio_file_done(self) -> None:
+        lbl = self._source_label.get()
+        if lbl.startswith("▶ "):
+            self._source_label.set("✓ " + lbl[2:])
+        self._file_mode = False
+        if self._decode_mode.get() == "ML" and not self._ml_pending:
+            self._ml_pending = True
+            path = self._last_file_path
+            if path:
+                threading.Thread(target=self._run_ml_file_inference,
+                                 args=(path,), daemon=True).start()
+            elif len(self._buffer) > 0:
+                data = self._buffer.copy()
+                threading.Thread(target=self._run_ml_inference,
+                                 args=(data,), daemon=True).start()
+
+    def _run_ml_file_inference(self, path: str) -> None:
+        """Run ML on the complete WAV file (avoids buffer truncation)."""
+        try:
+            from ml.inference import decode_wav_ml
+            result = decode_wav_ml(path, sr=SAMPLE_RATE)
+        except Exception as exc:
+            result = f"[ML error: {exc}]"
+        finally:
+            self._ml_pending = False
+        if result and not result.startswith("["):
+            self._root.after(0, lambda r=result: self._update_right_panel(r))
+        elif result and result.startswith("["):
+            self._root.after(0, lambda r=result: self._snr_var.set(r[:60]))
 
     def _update_right_panel(self, text: str) -> None:
         """Update letter tiles, Morse symbols, and full text box."""
@@ -402,7 +481,6 @@ class DecoderUI:
             return
 
         # Build Morse symbol string for display
-        from constants import TEXT_TO_MORSE
         morse_parts = []
         for ch in text:
             if ch == " ":
@@ -417,7 +495,6 @@ class DecoderUI:
             if i < len(display_chars):
                 ch = display_chars[i].upper()
                 td["letter"]["text"] = ch
-                from constants import TEXT_TO_MORSE
                 td["morse"]["text"]  = TEXT_TO_MORSE.get(ch, "")
             else:
                 td["letter"]["text"] = ""

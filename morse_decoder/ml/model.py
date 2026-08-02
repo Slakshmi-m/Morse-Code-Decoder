@@ -1,26 +1,13 @@
 """
-model_cnn.py — CNN-LSTM Morse Decoder (Advanced ML Path)
-=========================================================
-Architecture
-------------
-  Input   (B, 1, n_mels, T)  — log mel spectrogram
-  CNN     three conv blocks, each halving the mel-frequency dimension
-  LSTM    bidirectional 2-layer LSTM over the time axis
-  Linear  projection to VOCAB_SIZE log-softmax probabilities
-  Output  (B, T, VOCAB_SIZE) — per-frame character probabilities
+model.py — CRNN Morse Decoder (CNN + LSTM)
+==========================================
+Architecture:
+  Conv1d x3  — extract local tone/silence features from mel spectrogram
+  LSTM x2    — model the sequence (remembers dots/dashes across time)
+  Linear     — project to character probabilities for CTC
 
-How it works
-------------
-CNN scans the spectrogram like a 2D image — finds local patterns
-(a bright stripe at 700 Hz = a tone burst = a dit or dah).
-LSTM then reads the CNN features left-to-right (and right-to-left
-in the bidirectional pass) keeping memory of what came before,
-so it can learn sequences: dit → gap → dah = "A".
-
-Slower to train than the MLP but more powerful for sequences.
-
-Training: train.py --model cnn
-Inference: inference.py --model cnn
+Input  : (B, 1, n_mels, T)  log mel spectrogram
+Output : (B, T, VOCAB_SIZE)  per-frame log-probabilities
 """
 
 from __future__ import annotations
@@ -28,62 +15,53 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ml.model import BLANK_IDX, CHAR_TO_IDX, IDX_TO_CHAR, VOCAB, VOCAB_SIZE, greedy_decode
+VOCAB: list[str]             = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ")
+VOCAB_SIZE: int              = len(VOCAB) + 1
+BLANK_IDX: int               = 0
+CHAR_TO_IDX: dict[str, int]  = {c: i + 1 for i, c in enumerate(VOCAB)}
+IDX_TO_CHAR: dict[int, str]  = {i + 1: c for i, c in enumerate(VOCAB)}
 
-__all__ = ["MorseDecoderCNN"]
+
+def greedy_decode(log_probs: torch.Tensor) -> str:
+    """Collapse CTC per-frame log-probabilities into a text string."""
+    indices = log_probs.argmax(dim=-1).tolist()
+    chars: list[str] = []
+    prev = None
+    for idx in indices:
+        if idx != prev and idx != BLANK_IDX:
+            chars.append(IDX_TO_CHAR.get(idx, ""))
+        prev = idx
+    return "".join(chars).strip()
 
 
-class MorseDecoderCNN(nn.Module):
+class MorseDecoder(nn.Module):
     """
-    CNN feature extractor + bidirectional LSTM + CTC output head.
-
-    Parameters
-    ----------
-    n_mels  : int   Number of mel filterbank channels (default 64).
-    hidden  : int   LSTM hidden size per direction (default 256).
-    layers  : int   Number of LSTM layers (default 2).
+    CRNN Morse decoder — Conv1d extracts local features, LSTM models the sequence.
     """
 
-    def __init__(self, n_mels: int = 64, hidden: int = 256,
-                 layers: int = 2) -> None:
+    def __init__(self, n_mels: int = 32, cnn_channels: int = 64,
+                 hidden: int = 128, layers: int = 2) -> None:
         super().__init__()
-
-        # Three conv blocks — each MaxPool2d(2,1) halves the mel dimension,
-        # leaving the time axis intact so CTC can align over the full sequence.
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.MaxPool2d((2, 1)),
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.MaxPool2d((2, 1)),
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.MaxPool2d((2, 1)),
+        self.conv = nn.Sequential(
+            nn.Conv1d(n_mels, cnn_channels, kernel_size=7, padding=3),
+            nn.BatchNorm1d(cnn_channels), nn.ReLU(),
+            nn.Conv1d(cnn_channels, cnn_channels, kernel_size=5, padding=2),
+            nn.BatchNorm1d(cnn_channels), nn.ReLU(),
+            nn.Conv1d(cnn_channels, cnn_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(cnn_channels), nn.ReLU(),
         )
-        # After 3× mel-halving: effective mel dim = n_mels // 8
-        rnn_input = (n_mels // 8) * 128
-
-        self.rnn = nn.LSTM(
-            input_size=rnn_input,
-            hidden_size=hidden,
-            num_layers=layers,
-            batch_first=True,
-            dropout=0.3 if layers > 1 else 0.0,
-            bidirectional=True,
-        )
-        self.drop = nn.Dropout(0.3)
+        self.lstm = nn.LSTM(cnn_channels, hidden, layers,
+                            batch_first=True, bidirectional=True,
+                            dropout=0.2 if layers > 1 else 0.0)
+        self.drop = nn.Dropout(0.1)
         self.fc   = nn.Linear(hidden * 2, VOCAB_SIZE)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor  shape (B, 1, n_mels, T)
+        x = x.squeeze(1)           # (B, n_mels, T)
+        x = self.conv(x)           # (B, cnn_channels, T)
+        x = x.permute(0, 2, 1)    # (B, T, cnn_channels)
+        x, _ = self.lstm(x)        # (B, T, hidden*2)
+        return self.fc(self.drop(x)).log_softmax(dim=-1)
 
-        Returns
-        -------
-        torch.Tensor  shape (B, T, VOCAB_SIZE)  — log-softmax probabilities
-        """
-        x = self.cnn(x)                                    # (B, 128, n_mels//8, T)
-        b, c, f, t = x.shape
-        x = x.permute(0, 3, 1, 2).reshape(b, t, c * f)    # (B, T, features)
-        x, _ = self.rnn(self.drop(x))                      # (B, T, hidden*2)
-        return self.fc(self.drop(x)).log_softmax(dim=-1)   # (B, T, VOCAB_SIZE)
+
+MorseDecoderCNN = MorseDecoder  # backward-compat alias
