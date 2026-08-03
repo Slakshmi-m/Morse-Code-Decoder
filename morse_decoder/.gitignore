@@ -1,20 +1,31 @@
-# Generated dataset — too large to commit, regenerate with ml/data/generate_dataset.py
+# Generated dataset — regenerate with: python ml/data/generate_dataset.py
 dataset/
+ninja_dataset/
 
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
-# Claude AI session files
-.claude/
+# Virtual environments
+venv/
+.venv/
+env/
 
-# Training log files
+# Training logs and temp files
 train_*.txt
 *.log
+*.tmp
 
 # IDE / OS
 .vscode/
 .idea/
 *.DS_Store
 Thumbs.db
+
+# Claude AI session files
+.claude/
+
+# Zip archives
+*.zip
