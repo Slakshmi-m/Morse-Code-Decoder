@@ -525,34 +525,11 @@ class DecoderUI:
                 td["letter"]["text"] = ""
                 td["morse"]["text"]  = ""
 
-        # Accumulate decoded text: find overlap between what was shown before
-        # and what the new decode produced, then extend rather than replace.
+        # Always show the latest decode result — replace previous content.
         new_text = text.strip()
-        if not new_text:
+        if not new_text or new_text == self._full_text:
             return
-        prev = self._full_text.strip()
-        if not prev:
-            self._full_text = new_text
-        elif new_text.startswith(prev):
-            # New result is a direct extension of previous — keep growing
-            self._full_text = new_text
-        elif prev.endswith(new_text) or prev == new_text:
-            # No new content yet — skip redraw
-            return
-        else:
-            # Find longest suffix of prev that is a prefix of new_text
-            max_ov = min(len(prev), len(new_text))
-            overlap = 0
-            for k in range(max_ov, 0, -1):
-                if prev[-k:] == new_text[:k]:
-                    overlap = k
-                    break
-            if overlap > 0:
-                self._full_text = prev + new_text[overlap:]
-            else:
-                # Completely new content (e.g. new file) — append with separator
-                self._full_text = (prev + "  " + new_text) if prev else new_text
-
+        self._full_text = new_text
         self._text_box.configure(state=tk.NORMAL)
         self._text_box.delete("1.0", tk.END)
         self._text_box.insert(tk.END, self._full_text)
