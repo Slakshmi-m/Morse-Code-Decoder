@@ -150,7 +150,11 @@ def _split_at_word_gaps(samples: np.ndarray, sr: int,
     if not on_durs:
         return [samples]
 
-    rough_unit = float(np.percentile(on_durs, 25))
+    # Filter noise spikes before estimating the dit unit — same 10ms floor
+    # used in _dsp_preprocess so rough_unit is never distorted by music noise.
+    min_on      = int(sr * 0.010)
+    clean_durs  = [d for d in on_durs if d >= min_on] or on_durs
+    rough_unit  = float(np.percentile(clean_durs, 25))
     word_thresh = rough_unit * 5.0
 
     # Collect split points at the centre of each word-gap OFF segment
