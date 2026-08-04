@@ -189,9 +189,32 @@ def _load_model(model_path: str, device: torch.device):
     return _model_cache[key]
 
 
+def _trim_silence(samples: np.ndarray, sr: int) -> np.ndarray:
+    """
+    Strip leading/trailing silence from a reconstructed int16 buffer.
+    Prevents the model from seeing word-gap padding as signal,
+    which it can misread as spurious characters (e.g. '5' = ·····).
+    """
+    env  = np.abs(samples.astype(np.float32))
+    peak = np.max(env)
+    if peak == 0:
+        return samples
+    smooth = np.convolve(env / peak,
+                         np.ones(max(1, int(sr * 0.01))) / max(1, int(sr * 0.01)),
+                         mode="same")
+    above = np.where(smooth > 0.05)[0]
+    if len(above) == 0:
+        return samples
+    margin = int(sr * 0.01)   # 10 ms keep-alive margin on each side
+    return samples[max(0, above[0] - margin) : min(len(samples), above[-1] + margin)]
+
+
 def _run_model(samples: np.ndarray, sr: int, model, n_mels: int, device) -> str:
-    clean = _dsp_preprocess(samples, sr)
-    audio = torch.FloatTensor(clean.astype(np.float32) / 32768.0).unsqueeze(0)
+    clean   = _dsp_preprocess(samples, sr)
+    trimmed = _trim_silence(clean, sr)
+    if len(trimmed) < sr // 20:   # < 50 ms after trim — nothing meaningful
+        return ""
+    audio = torch.FloatTensor(trimmed.astype(np.float32) / 32768.0).unsqueeze(0)
     mel   = T.MelSpectrogram(sample_rate=sr, n_fft=256, hop_length=64, n_mels=n_mels)
     spec  = T.AmplitudeToDB()(mel(audio)).unsqueeze(0).to(device)
     with torch.no_grad():

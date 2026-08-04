@@ -401,18 +401,23 @@ class DecoderUI:
         data = self._buffer.copy()
 
         if self._decode_mode.get() == "ML":
+            # Always decode with DSP so tiles/text are never blank during streaming.
+            # ML result overwrites when it finishes (file: end of file; live: each cycle).
+            try:
+                engine   = MorseEngine(SAMPLE_RATE, data)
+                dsp_text = engine.decode()
+                self._snr_var.set(f"SNR: {engine.snr_db:.1f} dB")
+                if dsp_text and not dsp_text.startswith("["):
+                    self._update_right_panel(dsp_text)
+                if _MPL_OK:
+                    self._update_plots(data, engine)
+            except Exception:
+                pass
+            # Run ML inference only for live sources (file ML runs at end-of-file)
             if not self._file_mode and not self._ml_pending:
                 self._ml_pending = True
                 threading.Thread(target=self._run_ml_inference,
                                  args=(data,), daemon=True).start()
-            # Still update plots using DSP engine (no text output)
-            if _MPL_OK:
-                try:
-                    engine = MorseEngine(SAMPLE_RATE, data)
-                    engine.decode()
-                    self._update_plots(data, engine)
-                except Exception:
-                    pass
             return
 
         try:
