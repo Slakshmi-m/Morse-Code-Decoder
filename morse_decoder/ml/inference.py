@@ -72,8 +72,8 @@ def _dsp_preprocess(samples: np.ndarray, sr: int) -> np.ndarray:
     if peak > 0:
         env = env / peak
 
-    # 4. Smooth (5 ms box)
-    win    = max(1, int(sr * 0.005))
+    # 4. Smooth (10 ms box — longer window suppresses background music spikes)
+    win    = max(1, int(sr * 0.010))
     smooth = np.convolve(env, np.ones(win) / win, mode="same")
 
     floor = np.percentile(smooth, 5)
@@ -87,11 +87,13 @@ def _dsp_preprocess(samples: np.ndarray, sr: int) -> np.ndarray:
     segs    = [(int(binary[idx[i]]), int(np.diff(idx)[i])) for i in range(len(idx) - 1)]
 
     # 6. Noise-spike filter
-    on_durs = [d for s, d in segs if s == 1]
+    # Absolute floor: 10 ms at 8 kHz = 80 samples — nothing shorter is real Morse
+    # even at 120 WPM (competition speed). This kills music/background spikes.
+    on_durs    = [d for s, d in segs if s == 1]
     if not on_durs:
         return samples          # can't clean — return as-is
     rough_unit = np.percentile(on_durs, 25)
-    min_dur    = max(1, int(rough_unit / 3))
+    min_dur    = max(int(sr * 0.010), int(rough_unit / 3))
     segs       = [(s, d) for s, d in segs if d >= min_dur]
 
     # 7. Reconstruct clean 700 Hz audio
@@ -134,7 +136,7 @@ def _split_at_word_gaps(samples: np.ndarray, sr: int,
         return [samples]
     env = env / peak
 
-    win    = max(1, int(sr * 0.005))
+    win    = max(1, int(sr * 0.010))
     smooth = np.convolve(env, np.ones(win) / win, mode="same")
     floor  = np.percentile(smooth, 5)
     top    = np.percentile(smooth, 95)

@@ -116,7 +116,8 @@ class MorseEngine:
     def _bandpass_filter(self, data: np.ndarray,
                          lowcut: float, highcut: float,
                          order: int = 5) -> np.ndarray:
-        """Butterworth bandpass — removes out-of-band noise."""
+        """
+        erworth bandpass — removes out-of-band noise."""
         nyquist = 0.5 * self.sample_rate
         low     = max(0.01, lowcut  / nyquist)
         high    = min(0.99, highcut / nyquist)
@@ -132,7 +133,7 @@ class MorseEngine:
           SNR ≥  8 dB → 42%                       (moderate noise)
           SNR ≥ MIN   → 35%                       (heavy noise, more sensitive)
         """
-        window  = int(self.sample_rate * 0.005)  # 5 ms box smoothing
+        window  = int(self.sample_rate * 0.010)  # 10 ms — kills music/background spikes
         smooth  = np.convolve(self.data,
                               np.ones(window) / window,
                               mode="same")
@@ -172,7 +173,7 @@ class MorseEngine:
             "[Signal too weak — adjust volume]".
         """
         # ── SNR / noise gate ─────────────────────────────────────────────────
-        win    = int(self.sample_rate * 0.005)
+        win    = int(self.sample_rate * 0.010)
         smooth = np.convolve(self.data, np.ones(win) / win, mode="same")
 
         if not self._is_morse_signal(smooth):
@@ -192,7 +193,7 @@ class MorseEngine:
         rough_unit = np.percentile(all_on, 25)
 
         # Drop segments shorter than rough_unit/3 — noise spikes
-        min_dur  = max(1, int(rough_unit / 3))
+        min_dur  = max(int(self.sample_rate * 0.010), int(rough_unit / 3))
         segments = [(s, d) for s, d in raw_segs if d >= min_dur]
 
         on_durs  = [d for s, d in segments if s == 1]
