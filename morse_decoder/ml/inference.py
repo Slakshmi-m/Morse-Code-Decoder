@@ -58,9 +58,9 @@ def _dsp_preprocess(samples: np.ndarray, sr: int) -> np.ndarray:
     """
     float_data = samples.astype(np.float32) / 32768.0
 
-    # 1. Carrier detection
+    # 1. Carrier detection (400 Hz floor matches training data range)
     f, psd = welch(float_data, sr, nperseg=1024)
-    mask   = (f >= 500) & (f < 1200)
+    mask   = (f >= 400) & (f < 1200)
     carrier = float(f[mask][np.argmax(psd[mask])]) if np.any(mask) else 700.0
 
     # 2. Bandpass
@@ -124,7 +124,7 @@ def _split_at_word_gaps(samples: np.ndarray, sr: int,
     float_data = samples.astype(np.float32) / 32768.0
 
     f, psd  = welch(float_data, sr, nperseg=1024)
-    mask    = (f >= 500) & (f < 1200)
+    mask    = (f >= 400) & (f < 1200)
     carrier = float(f[mask][np.argmax(psd[mask])]) if np.any(mask) else 700.0
 
     filtered = _bandpass(float_data, sr, carrier - 200, carrier + 200)

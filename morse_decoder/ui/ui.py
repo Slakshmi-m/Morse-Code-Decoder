@@ -1,819 +1,720 @@
 """
-ui.py — Morse Code Decoder  ·  Modern Live Dashboard
-=====================================================
-Complete redesign. One window, everything live.
+ui.py — Tkinter Live Decoder Dashboard
+=======================================
+Assignment requirement: "A dedicated window must display the decoded
+text in real-time as it is being processed."
 
-LEFT  (60%)  — 5 signal panels updating in real-time
-RIGHT (40%)  — live decoded output with three views:
-                 • Letter tiles  (big coloured boxes, one per character)
-                 • Morse symbols (dots & dashes that built each letter)
-                 • Full text     (scrolling plain-text transcript)
+Layout
+------
+  Top bar      : control buttons (Open WAV, Microphone, System Audio, Stop, Clear)
+  Left column  : five matplotlib panels (oscilloscope, FFT, waterfall,
+                 binary signal, dit-dah histogram) — live-updating
+  Right column : decoded-letter tiles (large coloured cards with Morse dots
+                 beneath), Morse symbol stream, full decoded text box
 
-New in this version
--------------------
-  • Modern card-based toolbar with hover effects
-  • Live letter tiles — each decoded character appears as a glowing card
-    showing both the letter AND its Morse code underneath
-  • SNR meter bar (green → amber → red) in the status strip
-  • Signal quality badge (GOOD / OK / WEAK) next to the source name
-  • Carrier frequency and WPM shown as live badge pills
-  • Cleaner colour system — Catppuccin Mocha palette
+The dashboard accumulates audio in a rolling buffer (BUFFER_SECONDS) and
+re-decodes + re-draws every REFRESH_MS milliseconds using Tkinter's
+after() scheduler — no threads touching the GUI directly.
 """
 
-import os, sys, queue, threading, time
+from __future__ import annotations
+
+import queue
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox
+from tkinter import filedialog, messagebox, scrolledtext
 from typing import Optional
-from dsp.constants import TEXT_TO_MORSE
 
 import numpy as np
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from scipy.signal import butter, lfilter, spectrogram as scipy_spectrogram, welch
 
-# ── Catppuccin Mocha palette ──────────────────────────────────────────────────
-BG        = "#1E1E2E"   # base
-BG2       = "#181825"   # mantle
-BG3       = "#11111B"   # crust
-SURFACE0  = "#313244"
-SURFACE1  = "#45475A"
-OVERLAY   = "#6C7086"
-C_WHITE   = "#CDD6F4"   # text
-C_SUBTEXT = "#A6ADC8"
-C_GREEN   = "#A6E3A1"
-C_TEAL    = "#94E2D5"
-C_BLUE    = "#89B4FA"
-C_LAVENDER= "#B4BEFE"
-C_MAUVE   = "#CBA6F7"
-C_PINK    = "#F5C2E7"
-C_RED     = "#F38BA8"
-C_YELLOW  = "#F9E2AF"
-C_PEACH   = "#FAB387"
-C_CYAN    = "#00CFFF"
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from scipy.signal import butter, lfilter, welch
+    from scipy.signal import spectrogram as scipy_spectrogram
+    _MPL_OK = True
+except ImportError:
+    _MPL_OK = False
 
-# plot internals
-PANEL_BG  = "#181825"
-C_GREY    = "#45475A"
-C_LABEL   = "#A6ADC8"
+import threading
 
+from dsp.audio_input import AudioInput
+from dsp.constants   import MORSE_MAP, TEXT_TO_MORSE
+from dsp.corrector   import MorseCorrector
+from dsp.engine      import MorseEngine
 
-# One colour per letter tile (cycles through accent colours)
-_TILE_COLOURS = [
-    C_BLUE, C_MAUVE, C_GREEN, C_PEACH, C_TEAL,
-    C_LAVENDER, C_PINK, C_YELLOW, C_RED, C_CYAN,
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# Tunables
+# ─────────────────────────────────────────────────────────────────────────────
+BUFFER_SECONDS = 6       # rolling audio window decoded each cycle
+REFRESH_MS     = 250     # GUI update interval in ms
+MAX_TILES      = 8       # letter tiles visible in the right panel
+SAMPLE_RATE    = 8_000
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Colour tokens (dark SDR theme)
+# ─────────────────────────────────────────────────────────────────────────────
+BG        = "#0D0D1A"
+PANEL_BG  = "#11111F"
+ACCENT    = "#00FF88"
+ORANGE    = "#FF8800"
+YELLOW    = "#FFE500"
+CYAN      = "#00CFFF"
+RED_COL   = "#FF4466"
+BLUE_COL  = "#4488FF"
+GREY      = "#555577"
+LABEL_COL = "#AAAACC"
+WHITE     = "#E8E8FF"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Signal DSP helpers
-# ══════════════════════════════════════════════════════════════════════════════
+TILE_COLOURS = ["#1A3A4A", "#1A4A3A", "#3A1A4A", "#4A3A1A",
+                "#1A1A4A", "#4A1A1A", "#1A4A4A", "#4A1A4A"]
 
-def _bandpass(data: np.ndarray, sr: int):
-    f, psd = welch(data, sr, nperseg=min(1024, len(data)))
-    mask = (f > 200) & (f < 1400)
-    carrier = float(f[mask][np.argmax(psd[mask])]) if np.any(mask) else 700.0
-    lo = max(50.0, carrier - 200)
-    hi = min(sr / 2 - 1, carrier + 200)
-    nyq = sr / 2.0
-    b, a = butter(4, [lo / nyq, hi / nyq], btype="band")
-    return lfilter(b, a, data), carrier
-
-def _envelope(filtered, sr):
-    win = max(1, int(sr * 0.006))
-    return np.convolve(np.abs(filtered), np.ones(win) / win, mode="same")
-
-def _binary(env, sr=8000):
-    lo = np.percentile(env, 5); hi = np.percentile(env, 95)
-    thresh = lo + (hi - lo) * 0.45
-    binary = (env > thresh).astype(np.int8)
-    tps = np.sum(np.abs(np.diff(binary.astype(int)))) / (len(env) / sr)
-    return np.zeros(len(env), dtype=np.int8) if tps > 150 else binary
-
-def _segments(binary):
-    changes = np.diff(binary.astype(int))
-    idx = [0] + list(np.where(changes != 0)[0] + 1) + [len(binary)]
-    return [(int(binary[idx[i]]), idx[i+1]-idx[i]) for i in range(len(idx)-1)]
-
-def _unit(segs, sr):
-    on = [d for s, d in segs if s == 1]
-    if not on: return sr * 0.08
-    med = float(np.median(on))
-    dits = [d for d in on if d < med]
-    return float(np.mean(dits)) if dits else med / 2.0
-
-def _peak_freq(data, sr):
-    f, psd = welch(data, sr, nperseg=min(1024, len(data)))
-    mask = (f > 200) & (f < 1400)
-    return float(f[mask][np.argmax(psd[mask])]) if np.any(mask) else 700.0
-
-def _wpm(unit_samples, sr):
-    dot_s = unit_samples / sr
-    return round(1.2 / dot_s) if dot_s > 0 else 0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# StreamingDecoder
-# ══════════════════════════════════════════════════════════════════════════════
-
-class StreamingDecoder:
-    DECODE_WINDOW_SEC = 6.0
-    MIN_SEC           = 1.5
-    MAX_SEC           = 30.0
-    DECODE_EVERY_SEC  = 0.4
-
-    def __init__(self, sr, on_text, on_status, on_signal):
-        self.sr        = sr
-        self.on_text   = on_text
-        self.on_status = on_status
-        self.on_signal = on_signal
-        self._buf      = np.array([], dtype=np.float32)
-        self._last     = ""
-        self._max      = int(self.MAX_SEC * sr)
-        self._last_t   = 0.0
-        from src.engine import MorseEngine
-        from src.corrector import MorseCorrector
-        self._Engine    = MorseEngine
-        self._corrector = MorseCorrector()
-
-    def push(self, samples, rate):
-        self._buf = np.concatenate([self._buf, samples.astype(np.float32)])
-        if len(self._buf) > self._max:
-            self._buf = self._buf[-self._max:]
-        self.on_signal(self._buf.copy())
-
-        now = time.time()
-        if now - self._last_t < self.DECODE_EVERY_SEC: return
-        if len(self._buf) < int(self.MIN_SEC * self.sr):
-            self.on_status(("buffering", 0, 0, 0)); return
-        self._last_t = now
-
-        win    = int(self.DECODE_WINDOW_SEC * self.sr)
-        dbuf   = self._buf[-win:].copy().astype(np.int16)
-        try:
-            eng  = self._Engine(self.sr, dbuf)
-            text = self._corrector.correct(eng.decode())
-            if text != self._last:
-                self.on_text(text)
-                self._last = text
-
-            freq = _peak_freq(self._buf[-int(2*self.sr):], self.sr)
-            filt, _ = _bandpass(dbuf.astype(np.float32), self.sr)
-            env  = _envelope(filt, self.sr)
-            segs = _segments(_binary(env, self.sr))
-            u    = _unit(segs, self.sr)
-            self.on_status(("live", eng.snr_db, freq, _wpm(u, self.sr)))
-        except Exception as e:
-            self.on_status(("error", 0, 0, 0))
-
-    def reset(self):
-        self._buf  = np.array([], dtype=np.float32)
-        self._last = ""
-        self._last_t = 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LivePlotter — 5 panels
-# ══════════════════════════════════════════════════════════════════════════════
-
-class LivePlotter:
-    REFRESH_MS      = 150
-    WATERFALL_EVERY = 5
-    FREQ_MIN        = 200
-    FREQ_MAX        = 1400
-    HISTORY_S       = 6.0
-
-    def __init__(self, parent, sr):
-        self.sr       = sr
-        self._buf     = None
-        self._running = False
-        self._wf_tick = 0
-
-        plt.style.use("dark_background")
-        self.fig = plt.Figure(figsize=(8, 9), facecolor=BG, tight_layout=False)
-        self.fig.subplots_adjust(left=0.08, right=0.97, top=0.96,
-                                 bottom=0.05, hspace=0.58, wspace=0.32)
-        gs = gridspec.GridSpec(3, 2, figure=self.fig,
-                               height_ratios=[1, 1.15, 1],
-                               hspace=0.58, wspace=0.32,
-                               top=0.96, bottom=0.05,
-                               left=0.08, right=0.97)
-        self.ax_wave = self.fig.add_subplot(gs[0, 0])
-        self.ax_fft  = self.fig.add_subplot(gs[0, 1])
-        self.ax_fall = self.fig.add_subplot(gs[1, :])
-        self.ax_bin  = self.fig.add_subplot(gs[2, 0])
-        self.ax_hist = self.fig.add_subplot(gs[2, 1])
-
-        self._style_axes()
-        self._init_panels()
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def _style_axes(self):
-        for ax in (self.ax_wave, self.ax_fft, self.ax_fall,
-                   self.ax_bin, self.ax_hist):
-            ax.set_facecolor(PANEL_BG)
-            ax.tick_params(colors=C_LABEL, labelsize=7)
-            for sp in ax.spines.values():
-                sp.set_color(C_GREY)
-
-    def _init_panels(self):
-        titles = [
-            (self.ax_wave, "① Oscilloscope  (Raw Waveform)"),
-            (self.ax_fft,  "② FFT Spectrum  (Frequency Domain)"),
-            (self.ax_fall, "③ Waterfall / Spectrogram"),
-            (self.ax_bin,  "④ Binary Signal  (ON = Dit or Dah)"),
-            (self.ax_hist, "⑤ Dit / Dah / Space Durations"),
-        ]
-        for ax, t in titles:
-            ax.cla()
-            ax.set_facecolor(PANEL_BG)
-            for sp in ax.spines.values(): sp.set_color(C_GREY)
-            ax.set_title(t, color=C_WHITE, fontsize=8, pad=3, loc="left")
-            ax.tick_params(colors=C_LABEL, labelsize=7)
-            ax.text(0.5, 0.5, "Waiting for audio…",
-                    transform=ax.transAxes, ha="center", va="center",
-                    color=C_GREY, fontsize=9, style="italic")
-
-    def push(self, buf): self._buf = buf
-
-    def start(self, root):
-        self._root = root; self._running = True; self._schedule()
-
-    def stop(self): self._running = False
-
-    def reset(self):
-        self._buf = None; self._init_panels(); self.canvas.draw_idle()
-
-    def _schedule(self):
-        if self._running:
-            self._redraw()
-            self._root.after(self.REFRESH_MS, self._schedule)
-
-    def _redraw(self):
-        buf = self._buf
-        if buf is None or len(buf) < self.sr * 0.1: return
-        max_s = int(self.HISTORY_S * self.sr)
-        disp  = buf[-max_s:] if len(buf) > max_s else buf.copy()
-        pk    = np.max(np.abs(disp))
-        norm  = disp / pk if pk > 0 else disp
-        try:
-            filt, carrier = _bandpass(norm, self.sr)
-            env  = _envelope(filt, self.sr)
-            binv = _binary(env, self.sr)
-            segs = _segments(binv)
-            u    = _unit(segs, self.sr)
-            self._draw_wave  (norm, carrier)
-            self._draw_fft   (norm, carrier)
-            self._draw_binary(binv)
-            self._draw_hist  (segs, u)
-            self._wf_tick += 1
-            if self._wf_tick >= self.WATERFALL_EVERY:
-                self._draw_fall(norm, carrier)
-                self._wf_tick = 0
-            self.canvas.draw_idle()
-        except Exception as e:
-            print(f"[LivePlotter] _redraw error: {e}")
-
-    def _draw_wave(self, norm, carrier):
-        ax = self.ax_wave; ax.cla()
-        ax.set_facecolor(PANEL_BG)
-        for sp in ax.spines.values(): sp.set_color(C_GREY)
-        t = np.linspace(0, len(norm)/self.sr, len(norm))
-        ax.plot(t, norm, color=C_GREEN, linewidth=0.4, alpha=0.9)
-        ax.set_title("① Oscilloscope  (Raw Waveform)",
-                     color=C_WHITE, fontsize=8, pad=3, loc="left")
-        ax.set_xlabel("Time (s)", color=C_LABEL, fontsize=7)
-        ax.set_ylabel("Amp", color=C_LABEL, fontsize=7)
-        ax.set_xlim(0, t[-1]); ax.set_ylim(-1.15, 1.15)
-        ax.tick_params(colors=C_LABEL, labelsize=7)
-        ax.grid(True, color=C_GREY, linewidth=0.3, alpha=0.4)
-
-    def _draw_fft(self, norm, carrier):
-        ax = self.ax_fft; ax.cla()
-        ax.set_facecolor(PANEL_BG)
-        for sp in ax.spines.values(): sp.set_color(C_GREY)
-        win   = np.hanning(len(norm))
-        mags  = np.abs(np.fft.rfft(norm * win))
-        freqs = np.fft.rfftfreq(len(norm), d=1.0/self.sr)
-        mask  = (freqs >= self.FREQ_MIN) & (freqs <= self.FREQ_MAX)
-        f, m  = freqs[mask], mags[mask]
-        ax.fill_between(f, m, color=C_PEACH, alpha=0.40, linewidth=0)
-        ax.plot(f, m, color=C_PEACH, linewidth=0.9)
-        if len(m):
-            ax.axvline(carrier, color=C_YELLOW, linewidth=1.3, linestyle="--")
-            ax.text(carrier+15, m.max()*0.82,
-                    f"{carrier:.0f} Hz", color=C_YELLOW, fontsize=7.5, fontweight="bold")
-        ax.set_title("② FFT Spectrum  (Frequency Domain)",
-                     color=C_WHITE, fontsize=8, pad=3, loc="left")
-        ax.set_xlabel("Frequency (Hz)", color=C_LABEL, fontsize=7)
-        ax.set_xlim(self.FREQ_MIN, self.FREQ_MAX)
-        ax.tick_params(colors=C_LABEL, labelsize=7)
-        ax.grid(True, color=C_GREY, linewidth=0.3, alpha=0.4)
-
-    def _draw_fall(self, norm, carrier):
-        ax = self.ax_fall; ax.cla()
-        ax.set_facecolor(PANEL_BG)
-        for sp in ax.spines.values(): sp.set_color(C_GREY)
-        nperseg  = min(256, max(32, len(norm)//60))
-        noverlap = nperseg * 3 // 4
-        f, t, Sxx = scipy_spectrogram(norm, fs=self.sr,
-                                      nperseg=nperseg, noverlap=noverlap,
-                                      window="hann")
-        Sdb   = 10*np.log10(Sxx + 1e-12)
-        fmask = (f >= self.FREQ_MIN) & (f <= self.FREQ_MAX)
-        Sdb_f = Sdb[fmask]
-        if Sdb_f.size == 0 or len(t) < 2:
-            return
-        vmin = float(np.percentile(Sdb_f, 8))
-        vmax = float(np.percentile(Sdb_f, 99))
-        if vmin >= vmax:
-            vmax = vmin + 1.0
-        # freq on x-axis, time on y-axis
-        ax.pcolormesh(f[fmask], t, Sdb_f.T, shading="gouraud", cmap="inferno",
-                      vmin=vmin, vmax=vmax)
-        ax.axvline(carrier, color=C_YELLOW, linewidth=1.1, linestyle="--", alpha=0.85)
-        ax.text(carrier + 15, t[-1] * 0.95,
-                f"{carrier:.0f} Hz", color=C_YELLOW, fontsize=7.5,
-                ha="left", fontweight="bold")
-        ax.set_title("③ Waterfall / Spectrogram  —  Morse appears as bright vertical stripe",
-                     color=C_WHITE, fontsize=8, pad=3, loc="left")
-        ax.set_xlabel("Freq (Hz)", color=C_LABEL, fontsize=7)
-        ax.set_ylabel("Time (s)", color=C_LABEL, fontsize=7)
-        ax.set_xlim(self.FREQ_MIN, self.FREQ_MAX)
-        ax.tick_params(colors=C_LABEL, labelsize=7)
-
-    def _draw_binary(self, binv):
-        ax = self.ax_bin; ax.cla()
-        ax.set_facecolor(PANEL_BG)
-        for sp in ax.spines.values(): sp.set_color(C_GREY)
-        t = np.linspace(0, len(binv)/self.sr, len(binv))
-        ax.fill_between(t, binv.astype(float),
-                        step="pre", color=C_TEAL, alpha=0.65, linewidth=0)
-        ax.step(t, binv.astype(float), color=C_TEAL, linewidth=0.7, where="pre")
-        ax.set_title("④ Binary Signal  (ON = Dit or Dah)",
-                     color=C_WHITE, fontsize=8, pad=3, loc="left")
-        ax.set_xlabel("Time (s)", color=C_LABEL, fontsize=7)
-        ax.set_yticks([0, 1])
-        ax.set_yticklabels(["OFF", "ON"], color=C_LABEL, fontsize=7)
-        ax.set_xlim(0, t[-1]); ax.set_ylim(-0.15, 1.25)
-        ax.tick_params(colors=C_LABEL, labelsize=7)
-        ax.grid(True, axis="x", color=C_GREY, linewidth=0.3, alpha=0.4)
-
-    def _draw_hist(self, segs, u):
-        ax = self.ax_hist; ax.cla()
-        ax.set_facecolor(PANEL_BG)
-        for sp in ax.spines.values(): sp.set_color(C_GREY)
-        ms    = 1000.0 / self.sr
-        dits  = [d*ms for s,d in segs if s==1 and d < u*2]
-        dahs  = [d*ms for s,d in segs if s==1 and d >= u*2]
-        sps   = [d*ms for s,d in segs if s==0 and d >= u*0.5]
-        all_v = dits + dahs + sps
-        if not all_v:
-            ax.text(0.5, 0.5, "No pulses yet",
-                    transform=ax.transAxes, ha="center", va="center",
-                    color=C_GREY, fontsize=8, style="italic")
-            ax.set_title("⑤ Dit / Dah / Space Durations",
-                         color=C_WHITE, fontsize=8, pad=3, loc="left"); return
-        top  = min(max(all_v), u*14*ms)
-        bins = np.linspace(0, top, 32)
-        if dits: ax.hist(dits, bins=bins, color=C_GREEN, alpha=0.85,
-                         label=f"Dits ({len(dits)})", edgecolor="none")
-        if dahs: ax.hist(dahs, bins=bins, color=C_RED,   alpha=0.85,
-                         label=f"Dahs ({len(dahs)})", edgecolor="none")
-        if sps:  ax.hist(sps,  bins=bins, color=C_BLUE,  alpha=0.55,
-                         label=f"Spaces ({len(sps)})", edgecolor="none")
-        split = u*2*ms
-        ax.axvline(split, color=C_YELLOW, linewidth=1.2, linestyle="--")
-        ax.text(split*1.04, ax.get_ylim()[1]*0.88,
-                f"split\n{split:.0f}ms", color=C_YELLOW, fontsize=6.5)
-        ax.set_title("⑤ Dit / Dah / Space Durations",
-                     color=C_WHITE, fontsize=8, pad=3, loc="left")
-        ax.set_xlabel("Duration (ms)", color=C_LABEL, fontsize=7)
-        ax.set_ylabel("Count",         color=C_LABEL, fontsize=7)
-        ax.tick_params(colors=C_LABEL, labelsize=7)
-        ax.grid(True, axis="y", color=C_GREY, linewidth=0.3, alpha=0.4)
-        ax.legend(fontsize=7, facecolor=SURFACE0, edgecolor=C_GREY,
-                  labelcolor=C_WHITE, loc="upper right")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LetterTilePanel — scrolling row of decoded letter cards
-# ══════════════════════════════════════════════════════════════════════════════
-
-class LetterTilePanel(tk.Frame):
-    """
-    Horizontal scrolling row of letter 'tiles'.
-    Each tile shows:  large letter on top, Morse code dots/dashes below.
-    New tiles are added from the right; old ones scroll off the left.
-    """
-    TILE_W    = 58
-    TILE_H    = 72
-    MAX_TILES = 22     # how many tiles to keep in view
-
-    def __init__(self, parent, **kwargs):
-        super().__init__(parent, bg=BG3, **kwargs)
-        self._tiles   = []      # list of (letter, frame widget)
-        self._prev    = ""      # previous full decoded string
-
-        # scrollable canvas inside this frame
-        self._canvas  = tk.Canvas(self, bg=BG3, height=self.TILE_H + 8,
-                                  highlightthickness=0, bd=0)
-        self._canvas.pack(fill=tk.X, expand=True)
-        self._inner   = tk.Frame(self._canvas, bg=BG3)
-        self._window  = self._canvas.create_window(
-            0, 4, anchor="nw", window=self._inner)
-
-    def update_text(self, text: str):
-        """Called every time the decoder produces a new string."""
-        if text == self._prev:
-            return
-        self._prev = text
-
-        # Rebuild tiles for each character in the decoded text
-        for w in self._inner.winfo_children():
-            w.destroy()
-        self._tiles = []
-
-        chars = [c for c in text if c.strip()]  # skip spaces for tiles
-        # Only show the last MAX_TILES characters
-        chars = chars[-self.MAX_TILES:]
-
-        for i, ch in enumerate(chars):
-            colour = _TILE_COLOURS[ord(ch) % len(_TILE_COLOURS)]
-            morse  = TEXT_TO_MORSE.get(ch.upper(), "?")
-            self._make_tile(ch.upper(), morse, colour)
-
-        self._canvas.update_idletasks()
-        self._canvas.config(scrollregion=self._canvas.bbox("all"))
-        # scroll to the right to show latest tile
-        self._canvas.xview_moveto(1.0)
-
-    def _make_tile(self, letter, morse, colour):
-        tile = tk.Frame(self._inner, bg=SURFACE0,
-                        width=self.TILE_W, height=self.TILE_H,
-                        padx=3, pady=3)
-        tile.pack(side=tk.LEFT, padx=3, pady=4)
-        tile.pack_propagate(False)
-
-        # coloured top accent bar
-        tk.Frame(tile, bg=colour, height=3).pack(fill=tk.X)
-
-        # big letter
-        tk.Label(tile, text=letter, bg=SURFACE0, fg=colour,
-                 font=("Segoe UI", 22, "bold")).pack(pady=(2, 0))
-
-        # morse dots/dashes
-        tk.Label(tile, text=morse, bg=SURFACE0, fg=C_SUBTEXT,
-                 font=("Courier New", 9)).pack()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DecoderUI — main application window
-# ══════════════════════════════════════════════════════════════════════════════
 
 class DecoderUI:
+    """All-in-one live Morse decoder dashboard."""
 
-    def __init__(self, initial_file=None):
-        self._q           = queue.Queue()
-        self._audio_input = None
-        self._decoder     = None
-        self._plotter     = None
-        self._file        = initial_file
-
-        self._build_root()
-        self._build_titlebar()
-        self._build_body()
-        self._build_statusbar()
-
-        self._root.after(50, self._poll_queue)
-        if initial_file:
-            self._root.after(300, lambda: self._load_file(initial_file))
-
-    # ── root window ───────────────────────────────────────────────────────────
-
-    def _build_root(self):
+    def __init__(self, initial_file: Optional[str] = None) -> None:
         self._root = tk.Tk()
         self._root.title("Morse Code Decoder  ·  Live Dashboard")
-        self._root.geometry("1480x860")
-        self._root.minsize(1100, 700)
         self._root.configure(bg=BG)
-        self._root.resizable(True, True)
-        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._root.minsize(1100, 700)
 
-    # ── title bar ─────────────────────────────────────────────────────────────
+        # ── State ─────────────────────────────────────────────────────────────
+        self._audio       = AudioInput(sample_rate=SAMPLE_RATE)
+        self._audio._on_error = self._on_audio_error
+        self._corrector   = MorseCorrector()
+        self._buffer      = np.zeros(0, dtype=np.int16)
+        self._buf_max     = BUFFER_SECONDS * SAMPLE_RATE
+        self._chunk_q: queue.Queue[np.ndarray] = queue.Queue()
+        self._full_text   = ""
+        self._running     = False
+        self._source_label= tk.StringVar(value="—")
+        self._decode_mode    = tk.StringVar(value="DSP")
+        self._ml_pending     = False
+        self._file_mode      = False
+        self._last_file_path: Optional[str] = None
 
-    def _build_titlebar(self):
-        bar = tk.Frame(self._root, bg=BG2, pady=0)
-        bar.pack(fill=tk.X)
+        # Register audio callback (thread-safe via queue)
+        self._audio.register_callback(self._on_audio_chunk)
 
-        # left: app name + dot indicator
-        left = tk.Frame(bar, bg=BG2)
-        left.pack(side=tk.LEFT, padx=12, pady=8)
+        # ── Build UI ─────────────────────────────────────────────────────────
+        self._build_toolbar()
+        self._build_main_area()
 
-        self._dot = tk.Label(left, text="●", bg=BG2, fg=SURFACE1,
-                             font=("Segoe UI", 11))
-        self._dot.pack(side=tk.LEFT, padx=(0, 6))
+        # ── Start refresh loop ────────────────────────────────────────────────
+        self._root.after(REFRESH_MS, self._refresh)
 
-        tk.Label(left, text="Morse Code Decoder", bg=BG2, fg=C_WHITE,
-                 font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT)
-        tk.Label(left, text="  Live Dashboard", bg=BG2, fg=OVERLAY,
-                 font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        # ── Auto-open file if given ───────────────────────────────────────────
+        if initial_file:
+            self._root.after(200, lambda: self._open_file(initial_file))
 
-        # right: buttons
-        right = tk.Frame(bar, bg=BG2)
-        right.pack(side=tk.RIGHT, padx=10, pady=6)
+    # ──────────────────────────────────────────────────────────────────────────
+    # Toolbar
+    # ──────────────────────────────────────────────────────────────────────────
 
-        self._make_btn(right, "📂  Open File",     self._browse,       C_BLUE  ).pack(side=tk.LEFT, padx=3)
-        self._make_btn(right, "🎙  Microphone",   self._start_mic,    C_MAUVE ).pack(side=tk.LEFT, padx=3)
-        self._make_btn(right, "🔊  System Audio", self._start_system, C_GREEN ).pack(side=tk.LEFT, padx=3)
-        self._make_btn(right, "⏹  Stop",          self._stop,         C_PEACH ).pack(side=tk.LEFT, padx=3)
-        self._make_btn(right, "🗑  Clear",         self._clear,        OVERLAY ).pack(side=tk.LEFT, padx=3)
+    def _build_toolbar(self) -> None:
+        bar = tk.Frame(self._root, bg=PANEL_BG, pady=6)
+        bar.pack(fill=tk.X, side=tk.TOP)
 
-        # source label pill
-        self._source_lbl = tk.Label(right, text="  No source  ",
-                                    bg=SURFACE0, fg=C_SUBTEXT,
-                                    font=("Segoe UI", 8),
-                                    padx=8, pady=2, relief=tk.FLAT)
-        self._source_lbl.pack(side=tk.LEFT, padx=(12, 0))
+        title = tk.Label(bar, text="Morse Code Decoder",
+                         bg=PANEL_BG, fg=ACCENT,
+                         font=("Consolas", 14, "bold"))
+        title.pack(side=tk.LEFT, padx=14)
 
-    def _make_btn(self, parent, text, cmd, colour):
-        btn = tk.Label(parent, text=text, bg=SURFACE0, fg=colour,
-                       font=("Segoe UI", 9, "bold"),
-                       padx=10, pady=5, cursor="hand2", relief=tk.FLAT)
-        btn.bind("<Button-1>", lambda e: cmd())
-        btn.bind("<Enter>",    lambda e: btn.config(bg=SURFACE1))
-        btn.bind("<Leave>",    lambda e: btn.config(bg=SURFACE0))
-        return btn
+        sub = tk.Label(bar, text="Live Dashboard",
+                       bg=PANEL_BG, fg=GREY, font=("Consolas", 9))
+        sub.pack(side=tk.LEFT)
 
-    # ── body: left plots + right panel ────────────────────────────────────────
+        btn_cfg = dict(bg="#1C2A3A", fg=WHITE, activebackground="#2A4A6A",
+                       activeforeground=WHITE, relief=tk.FLAT,
+                       font=("Consolas", 9), padx=10, pady=4, cursor="hand2")
 
-    def _build_body(self):
-        body = tk.Frame(self._root, bg=BG)
-        body.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+        tk.Button(bar, text="⊙ Open Audio",
+                  command=self._browse_wav, **btn_cfg).pack(side=tk.LEFT, padx=4)
+        tk.Button(bar, text="● Microphone",
+                  command=self._start_mic, **btn_cfg).pack(side=tk.LEFT, padx=4)
+        tk.Button(bar, text="◉ System Audio",
+                  command=self._start_system_audio, **btn_cfg).pack(side=tk.LEFT, padx=4)
+        tk.Button(bar, text="■ Stop",
+                  command=self._stop, **btn_cfg).pack(side=tk.LEFT, padx=4)
+        tk.Button(bar, text="✕ Clear",
+                  command=self._clear, **btn_cfg).pack(side=tk.LEFT, padx=4)
 
-        # ── LEFT: 5-panel signal visualiser ───────────────────────────────────
-        left = tk.Frame(body, bg=BG)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._plotter = LivePlotter(left, sr=8000)
+        src = tk.Label(bar, textvariable=self._source_label,
+                       bg=PANEL_BG, fg=CYAN, font=("Consolas", 9))
+        src.pack(side=tk.RIGHT, padx=14)
 
-        # ── RIGHT: output panel ────────────────────────────────────────────────
-        right = tk.Frame(body, bg=BG2, width=440)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(6, 0))
+        # ML / DSP mode toggle
+        mode_frame = tk.Frame(bar, bg=PANEL_BG)
+        mode_frame.pack(side=tk.RIGHT, padx=10)
+        tk.Label(mode_frame, text="Mode:", bg=PANEL_BG, fg=LABEL_COL,
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+        for mode, col in [("DSP", ACCENT), ("ML", CYAN)]:
+            tk.Radiobutton(mode_frame, text=mode, variable=self._decode_mode,
+                           value=mode, bg=PANEL_BG, fg=col,
+                           selectcolor=PANEL_BG, activebackground=PANEL_BG,
+                           font=("Consolas", 8, "bold")
+                           ).pack(side=tk.LEFT, padx=4)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Main area: left = plots, right = decoded text
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _build_main_area(self) -> None:
+        main = tk.Frame(self._root, bg=BG)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # ── Left: matplotlib canvas ───────────────────────────────────────────
+        if _MPL_OK:
+            self._fig, self._axes = self._create_figure()
+            self._canvas = FigureCanvasTkAgg(self._fig, master=main)
+            self._canvas.get_tk_widget().pack(
+                side=tk.LEFT, fill=tk.BOTH, expand=True
+            )
+        else:
+            tk.Label(main, text="matplotlib not installed\npip install matplotlib",
+                     bg=BG, fg=RED_COL, font=("Consolas", 12)
+                     ).pack(side=tk.LEFT, expand=True)
+
+        # ── Right: decoded output panel ───────────────────────────────────────
+        right = tk.Frame(main, bg=PANEL_BG, width=310)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=0)
         right.pack_propagate(False)
 
-        # ── section header helper ──────────────────────────────────────────────
-        def section(parent, title):
-            tk.Label(parent, text=title, bg=BG2, fg=C_BLUE,
-                     font=("Segoe UI", 8, "bold"),
-                     padx=10, pady=4).pack(anchor=tk.W)
-            tk.Frame(parent, bg=SURFACE0, height=1).pack(fill=tk.X, padx=10)
+        self._build_right_panel(right)
 
-        # ── 1. Letter tiles ────────────────────────────────────────────────────
-        section(right, "DECODED LETTERS")
-        self._tiles = LetterTilePanel(right, height=88)
-        self._tiles.pack(fill=tk.X, padx=6, pady=(4, 8))
-
-        # ── 2. Morse symbols ───────────────────────────────────────────────────
-        section(right, "MORSE SYMBOLS")
-        self._morse_area = scrolledtext.ScrolledText(
-            right, font=("Courier New", 10),
-            bg=BG3, fg=C_YELLOW,
-            insertbackground=C_WHITE, selectbackground=C_BLUE,
-            wrap=tk.WORD, relief=tk.FLAT, padx=8, pady=6,
-            height=4, state=tk.DISABLED, borderwidth=0,
+    def _create_figure(self):
+        """Create the 5-panel matplotlib figure."""
+        plt.style.use("dark_background")
+        fig = plt.figure(figsize=(10, 8), facecolor=BG, tight_layout=False)
+        fig.subplots_adjust(
+            top=0.96, bottom=0.06,
+            left=0.08, right=0.97,
+            hspace=0.52, wspace=0.35,
         )
-        self._morse_area.pack(fill=tk.X, padx=6, pady=(4, 8))
+        gs = gridspec.GridSpec(3, 2, figure=fig,
+                               height_ratios=[1, 1.1, 1])
 
-        # ── 3. Full decoded text ───────────────────────────────────────────────
-        section(right, "FULL DECODED TEXT")
-        self._text_area = scrolledtext.ScrolledText(
-            right, font=("Courier New", 13),
-            bg=BG3, fg=C_WHITE,
-            insertbackground=C_WHITE, selectbackground=C_BLUE,
-            wrap=tk.WORD, relief=tk.FLAT, padx=10, pady=8,
-            state=tk.DISABLED, borderwidth=0,
+        ax_wave  = fig.add_subplot(gs[0, 0])
+        ax_fft   = fig.add_subplot(gs[0, 1])
+        ax_wfall = fig.add_subplot(gs[1, :])
+        ax_bin   = fig.add_subplot(gs[2, 0])
+        ax_hist  = fig.add_subplot(gs[2, 1])
+
+        axes = dict(wave=ax_wave, fft=ax_fft,
+                    wfall=ax_wfall, bin=ax_bin, hist=ax_hist)
+        for ax in axes.values():
+            ax.set_facecolor(PANEL_BG)
+            ax.tick_params(colors=LABEL_COL, labelsize=7)
+            for sp in ax.spines.values():
+                sp.set_color(GREY)
+
+        # Static titles
+        ax_wave.set_title("① Oscilloscope  (Raw Waveform)",
+                          color=WHITE, fontsize=8, loc="left", pad=3)
+        ax_fft.set_title("② FFT Spectrum  (Frequency Domain)",
+                         color=WHITE, fontsize=8, loc="left", pad=3)
+        ax_wfall.set_title("③ Waterfall / Spectrogram",
+                           color=WHITE, fontsize=8, loc="left", pad=3)
+        ax_bin.set_title("④ Binary Signal  (ON = Dit or Dah)",
+                         color=WHITE, fontsize=8, loc="left", pad=3)
+        ax_hist.set_title("⑤ Dit / Dah / Space Durations",
+                          color=WHITE, fontsize=8, loc="left", pad=3)
+
+        return fig, axes
+
+    def _build_right_panel(self, parent: tk.Frame) -> None:
+        """Build the decoded letters / text section."""
+        pad = dict(padx=10, pady=4)
+
+        # Section: decoded letter tiles
+        tk.Label(parent, text="DECODED LETTERS",
+                 bg=PANEL_BG, fg=LABEL_COL,
+                 font=("Consolas", 8, "bold")).pack(anchor="w", **pad)
+
+        self._tile_frame = tk.Frame(parent, bg=PANEL_BG)
+        self._tile_frame.pack(fill=tk.X, **pad)
+        self._tiles: list[dict] = []
+        for i in range(MAX_TILES):
+            col = TILE_COLOURS[i % len(TILE_COLOURS)]
+            frm = tk.Frame(self._tile_frame, bg=col, width=32, height=52)
+            frm.pack(side=tk.LEFT, padx=2)
+            frm.pack_propagate(False)
+            ltr = tk.Label(frm, text="", bg=col, fg=WHITE,
+                           font=("Consolas", 18, "bold"))
+            ltr.pack(expand=True)
+            sub = tk.Label(frm, text="", bg=col, fg=LABEL_COL,
+                           font=("Consolas", 6))
+            sub.pack()
+            self._tiles.append({"frame": frm, "letter": ltr, "morse": sub, "bg": col})
+
+        tk.Frame(parent, bg=GREY, height=1).pack(fill=tk.X, padx=10, pady=6)
+
+        # Section: raw Morse symbols
+        tk.Label(parent, text="MORSE SYMBOLS",
+                 bg=PANEL_BG, fg=LABEL_COL,
+                 font=("Consolas", 8, "bold")).pack(anchor="w", **pad)
+        self._morse_var = tk.StringVar(value="")
+        tk.Label(parent, textvariable=self._morse_var,
+                 bg=PANEL_BG, fg=YELLOW,
+                 font=("Consolas", 10), wraplength=280, justify=tk.LEFT
+                 ).pack(anchor="w", **pad)
+
+        tk.Frame(parent, bg=GREY, height=1).pack(fill=tk.X, padx=10, pady=6)
+
+        # Section: full decoded text
+        tk.Label(parent, text="FULL DECODED TEXT",
+                 bg=PANEL_BG, fg=LABEL_COL,
+                 font=("Consolas", 8, "bold")).pack(anchor="w", **pad)
+        self._text_box = scrolledtext.ScrolledText(
+            parent, bg="#0A0A18", fg=WHITE,
+            font=("Consolas", 12), wrap=tk.WORD,
+            relief=tk.FLAT, height=10, state=tk.DISABLED,
         )
-        self._text_area.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 0))
+        self._text_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
-    # ── status bar ────────────────────────────────────────────────────────────
+        # SNR badge
+        self._snr_var = tk.StringVar(value="SNR: —")
+        tk.Label(parent, textvariable=self._snr_var,
+                 bg=PANEL_BG, fg=CYAN, font=("Consolas", 8)
+                 ).pack(anchor="e", padx=10, pady=2)
 
-    def _build_statusbar(self):
-        bar = tk.Frame(self._root, bg=BG2, height=28)
-        bar.pack(fill=tk.X, side=tk.BOTTOM)
-        bar.pack_propagate(False)
+    # ──────────────────────────────────────────────────────────────────────────
+    # Audio control buttons
+    # ──────────────────────────────────────────────────────────────────────────
 
-        inner = tk.Frame(bar, bg=BG2)
-        inner.pack(fill=tk.X, padx=10, pady=4)
+    def _browse_wav(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open Audio File",
+            filetypes=[
+                ("Audio files", "*.wav *.mp3"),
+                ("WAV files",   "*.wav"),
+                ("MP3 files",   "*.mp3"),
+                ("All files",   "*.*"),
+            ],
+        )
+        if path:
+            self._open_file(path)
 
-        # SNR bar
-        tk.Label(inner, text="SNR", bg=BG2, fg=OVERLAY,
-                 font=("Segoe UI", 7)).pack(side=tk.LEFT)
-        self._snr_canvas = tk.Canvas(inner, bg=SURFACE0, width=80, height=10,
-                                     highlightthickness=0, bd=0)
-        self._snr_canvas.pack(side=tk.LEFT, padx=(4, 12))
-        self._snr_bar = self._snr_canvas.create_rectangle(
-            0, 0, 0, 10, fill=C_GREEN, outline="")
+    def _open_file(self, path: str) -> None:
+        self._stop()
+        self._clear()
+        self._file_mode      = True
+        self._last_file_path = path
+        ext = path.rsplit(".", 1)[-1].upper() if "." in path else "FILE"
+        self._source_label.set(f"▶ {ext}: {path.replace('\\', '/').split('/')[-1]}")
+        self._running = True
+        self._audio._on_complete = lambda: self._root.after(0, self._on_audio_file_done)
+        self._audio.stream_file_async(path, realtime=True)
 
-        # status pills
-        self._pill_freq = self._make_pill(inner, "--- Hz")
-        self._pill_wpm  = self._make_pill(inner, "-- WPM")
-        self._pill_snr  = self._make_pill(inner, "WAITING", OVERLAY)
-
-        # right: main status text
-        self._status_var = tk.StringVar(value="Ready — open a file or start audio input")
-        tk.Label(inner, textvariable=self._status_var,
-                 bg=BG2, fg=OVERLAY, font=("Segoe UI", 8),
-                 anchor=tk.E).pack(side=tk.RIGHT, padx=4)
-
-    def _make_pill(self, parent, text, colour=C_TEAL):
-        lbl = tk.Label(parent, text=text, bg=SURFACE0, fg=colour,
-                       font=("Segoe UI", 8, "bold"), padx=7, pady=1)
-        lbl.pack(side=tk.LEFT, padx=3)
-        return lbl
-
-    # ── actions ───────────────────────────────────────────────────────────────
-
-    def _browse(self):
-        p = filedialog.askopenfilename(
-            title="Select an audio file",
-            filetypes=[("Audio files", "*.wav *.mp3"), ("WAV files", "*.wav"),
-                       ("MP3 files", "*.mp3"), ("All files", "*.*")])
-        if p: self._load_file(p)
-
-    def _load_file(self, path):
-        if not os.path.exists(path):
-            messagebox.showerror("File not found", f"Cannot find:\n{path}"); return
-        self._stop(); self._clear()
-        self._file = path
-        self._source_lbl.config(text=f"  {os.path.basename(path)}  ")
-        self._set_status(f"Loading {os.path.basename(path)}…")
-        self._start_pipeline(file_path=path)
-
-    def _start_mic(self):
-        self._stop(); self._clear()
-        self._file = None
-        self._source_lbl.config(text="  🎙 Microphone  ")
+    def _start_mic(self) -> None:
+        self._stop()
+        self._clear()
+        self._file_mode = False
         try:
-            self._start_pipeline(mic=True)
-            self._set_status("🎙 Listening on microphone…")
-        except RuntimeError as e:
-            messagebox.showwarning("Mic unavailable", str(e))
+            self._audio.start_microphone()
+            self._running = True
+            self._source_label.set("● Microphone")
+        except RuntimeError as exc:
+            messagebox.showerror("Microphone Error", str(exc))
 
-    def _start_system(self):
-        self._stop(); self._clear()
-        self._file = None
+    def _start_system_audio(self) -> None:
+        self._stop()
+        self._clear()
+        self._file_mode = False
         try:
-            from src.audio_input import _PAW_AVAILABLE
-            if not _PAW_AVAILABLE:
-                self._show_install_pawpatch(); return
-            self._source_lbl.config(text="  🔊 WASAPI Loopback  ")
-            self._set_status("🔊 Opening WASAPI loopback…")
-            self._start_pipeline(system_audio=True)
-            self._set_status("🔊 Ready — play your YouTube video now!")
-        except Exception as e:
-            self._set_status(f"System audio error: {e}")
-            messagebox.showerror("System Audio Error", str(e))
+            label = self._audio.start_system_audio()
+            self._running = True
+            self._source_label.set(f"◉ {label}")
+        except RuntimeError as exc:
+            if "NEED_PAWPATCH" in str(exc):
+                messagebox.showinfo(
+                    "Install required",
+                    "System audio capture needs pyaudiowpatch.\n\n"
+                    "Run in your terminal:\n    pip install pyaudiowpatch",
+                )
+            else:
+                messagebox.showerror("System Audio Error", str(exc))
 
-    def _start_pipeline(self, file_path=None, mic=False, system_audio=False):
-        from src.audio_input import AudioInput
-        ai  = AudioInput(sample_rate=8000)
-        dec = StreamingDecoder(
-            sr       = 8000,
-            on_text  = lambda t: self._q.put(("text",   t)),
-            on_status= lambda s: self._q.put(("status", s)),
-            on_signal= lambda b: self._q.put(("signal", b)),
-        )
-        ai._on_error = lambda m: self._q.put(("stream_error", m))
-        ai.register_callback(dec.push)
-        if system_audio:
-            ai.start_system_audio()
-        elif mic:
-            ai.start_microphone()
+    def _stop(self) -> None:
+        self._running   = False
+        self._file_mode = False
+        self._audio.stop()
+        self._source_label.set("■ Stopped")
+
+    def _clear(self) -> None:
+        self._buffer    = np.zeros(0, dtype=np.int16)
+        self._full_text = ""
+        self._morse_var.set("")
+        self._snr_var.set("SNR: —")
+        # Clear tiles
+        for t in self._tiles:
+            t["letter"]["text"] = ""
+            t["morse"]["text"]  = ""
+        # Clear text box
+        self._text_box.configure(state=tk.NORMAL)
+        self._text_box.delete("1.0", tk.END)
+        self._text_box.configure(state=tk.DISABLED)
+        # Clear plots
+        if _MPL_OK:
+            for ax in self._axes.values():
+                ax.cla()
+                ax.set_facecolor(PANEL_BG)
+            self._canvas.draw_idle()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Audio callback (called from capture thread → push to queue)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _on_audio_chunk(self, samples: np.ndarray, _sr: int) -> None:
+        self._chunk_q.put(samples)
+
+    def _on_audio_error(self, msg: str) -> None:
+        self._root.after(0, lambda: messagebox.showerror("Audio Error", msg))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Refresh loop — runs in the Tk main thread via after()
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _refresh(self) -> None:
+        new_data = False
+        while not self._chunk_q.empty():
+            chunk = self._chunk_q.get_nowait()
+            self._buffer = np.concatenate([self._buffer, chunk])
+            new_data = True
+
+        if len(self._buffer) > self._buf_max:
+            self._buffer = self._buffer[-self._buf_max:]
+
+        if new_data and len(self._buffer) > SAMPLE_RATE // 2:
+            self._decode_and_update()
+
+        self._root.after(REFRESH_MS, self._refresh)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Decode + UI update
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _decode_and_update(self) -> None:
+        data = self._buffer.copy()
+
+        if self._decode_mode.get() == "ML":
+            if not self._file_mode and not self._ml_pending:
+                self._ml_pending = True
+                threading.Thread(target=self._run_ml_inference,
+                                 args=(data,), daemon=True).start()
+            # Still update plots using DSP engine (no text output)
+            if _MPL_OK:
+                try:
+                    engine = MorseEngine(SAMPLE_RATE, data)
+                    engine.decode()
+                    self._update_plots(data, engine)
+                except Exception:
+                    pass
+            return
+
+        try:
+            engine   = MorseEngine(SAMPLE_RATE, data)
+            raw_text = engine.decode()
+            snr      = engine.snr_db
+        except Exception as exc:
+            print(f"[UI] Engine error: {exc}")
+            return
+
+        if raw_text and not raw_text.startswith("["):
+            corrected = self._corrector.correct(raw_text)
         else:
-            ai.stream_file_async(file_path, realtime=True)
-        self._audio_input = ai
-        self._decoder     = dec
-        self._plotter.start(self._root)
-        self._dot.config(fg=C_GREEN)    # green dot = active
+            corrected = raw_text
 
-    def _stop(self):
-        self._plotter.stop(); self._plotter.reset()
-        if self._audio_input: self._audio_input.stop(); self._audio_input = None
-        if self._decoder:     self._decoder.reset();    self._decoder     = None
-        self._dot.config(fg=SURFACE1)
-        self._set_status("Stopped.")
-        self._update_status_bar(0, 0, 0)
+        self._snr_var.set(f"SNR: {snr:.1f} dB")
+        self._update_right_panel(corrected)
+        if _MPL_OK:
+            self._update_plots(data, engine)
 
-    def _clear(self):
-        self._tiles.update_text("")
-        for area in (self._morse_area, self._text_area):
-            area.config(state=tk.NORMAL)
-            area.delete("1.0", tk.END)
-            area.config(state=tk.DISABLED)
-
-    # ── queue polling ─────────────────────────────────────────────────────────
-
-    def _poll_queue(self):
+    def _run_ml_inference(self, data: np.ndarray) -> None:
         try:
-            while True:
-                kind, payload = self._q.get_nowait()
-                if   kind == "text":         self._show_text(payload)
-                elif kind == "status":       self._handle_status(payload)
-                elif kind == "signal":       self._plotter.push(payload)
-                elif kind == "stream_error": self._set_status("⚠ Stream failed"); messagebox.showerror("Audio Error", payload)
-        except queue.Empty:
-            pass
-        self._root.after(50, self._poll_queue)
+            from ml.inference import decode_buffer_ml
+            result = decode_buffer_ml(data, sr=SAMPLE_RATE)
+        except Exception as exc:
+            result = f"[ML error: {exc}]"
+        finally:
+            self._ml_pending = False
+        if result and not result.startswith("["):
+            self._root.after(0, lambda r=result: self._update_right_panel(r))
+        elif result and result.startswith("["):
+            self._root.after(0, lambda r=result: self._snr_var.set(r[:60]))
 
-    def _handle_status(self, payload):
-        kind, snr, freq, wpm = payload
-        if kind == "buffering":
-            self._set_status("Buffering audio…")
-            self._update_status_bar(0, 0, 0)
-        elif kind == "live":
-            self._update_status_bar(snr, freq, wpm)
-        elif kind == "error":
-            self._set_status("Decode error")
+    def _on_audio_file_done(self) -> None:
+        lbl = self._source_label.get()
+        if lbl.startswith("▶ "):
+            self._source_label.set("✓ " + lbl[2:])
+        self._file_mode = False
+        if self._decode_mode.get() == "ML" and not self._ml_pending:
+            self._ml_pending = True
+            path = self._last_file_path
+            if path:
+                threading.Thread(target=self._run_ml_file_inference,
+                                 args=(path,), daemon=True).start()
+            elif len(self._buffer) > 0:
+                data = self._buffer.copy()
+                threading.Thread(target=self._run_ml_inference,
+                                 args=(data,), daemon=True).start()
 
-    def _update_status_bar(self, snr, freq, wpm):
-        # SNR meter bar (0–50 dB range)
-        pct = min(1.0, max(0.0, (snr - 10) / 40.0))
-        bar_w = int(80 * pct)
-        colour = C_GREEN if snr >= 28 else C_YELLOW if snr >= 20 else C_RED
-        self._snr_canvas.coords(self._snr_bar, 0, 0, bar_w, 10)
-        self._snr_canvas.itemconfig(self._snr_bar, fill=colour)
-
-        # pills
-        self._pill_freq.config(text=f"{freq:.0f} Hz" if freq else "--- Hz")
-        self._pill_wpm .config(text=f"{wpm} WPM"     if wpm  else "-- WPM")
-        if   snr >= 28: self._pill_snr.config(text="GOOD",    fg=C_GREEN)
-        elif snr >= 20: self._pill_snr.config(text="OK",      fg=C_YELLOW)
-        elif snr >  0:  self._pill_snr.config(text="WEAK",    fg=C_RED)
-        else:           self._pill_snr.config(text="WAITING", fg=OVERLAY)
-
-    # ── text display ──────────────────────────────────────────────────────────
-
-    def _show_text(self, decoded: str):
-        # letter tiles
-        self._tiles.update_text(decoded)
-
-        # full text area
-        self._text_area.config(state=tk.NORMAL)
-        self._text_area.delete("1.0", tk.END)
-        self._text_area.insert(tk.END, decoded)
-        self._text_area.see(tk.END)
-        self._text_area.config(state=tk.DISABLED)
-
-        # morse symbols
+    def _run_ml_file_inference(self, path: str) -> None:
+        """Run ML on the complete audio file (WAV or MP3)."""
         try:
-            syms = "  ".join(
-                TEXT_TO_MORSE.get(c, "?") if c != " " else "/"
-                for c in decoded
-            )
-        except Exception:
-            syms = decoded
-        self._morse_area.config(state=tk.NORMAL)
-        self._morse_area.delete("1.0", tk.END)
-        self._morse_area.insert(tk.END, syms)
-        self._morse_area.see(tk.END)
-        self._morse_area.config(state=tk.DISABLED)
+            if path.lower().endswith(".mp3"):
+                from ml.inference import decode_buffer_ml
+                from dsp.audio_input import AudioInput
+                samples, fs = AudioInput._load_mp3(path)
+                if fs != SAMPLE_RATE:
+                    import numpy as _np
+                    n       = int(len(samples) * SAMPLE_RATE / fs)
+                    samples = _np.interp(
+                        _np.linspace(0, 1, n),
+                        _np.linspace(0, 1, len(samples)),
+                        samples.astype(_np.float32),
+                    ).clip(-32767, 32767).astype(_np.int16)
+                result = decode_buffer_ml(samples, sr=SAMPLE_RATE)
+            else:
+                from ml.inference import decode_wav_ml
+                result = decode_wav_ml(path, sr=SAMPLE_RATE)
+        except Exception as exc:
+            result = f"[ML error: {exc}]"
+        finally:
+            self._ml_pending = False
+        if result and not result.startswith("["):
+            self._root.after(0, lambda r=result: self._update_right_panel(r))
+        elif result and result.startswith("["):
+            self._root.after(0, lambda r=result: self._snr_var.set(r[:60]))
 
-    def _set_status(self, msg):
-        self._status_var.set(msg)
+    def _update_right_panel(self, text: str) -> None:
+        """Update letter tiles, Morse symbols, and full text box."""
+        if not text or text.startswith("["):
+            return
 
-    # ── popups ────────────────────────────────────────────────────────────────
+        # Accumulate only new printable characters
+        new_chars = [c for c in text if c.strip()]
+        if not new_chars:
+            return
 
-    def _show_install_pawpatch(self):
-        win = tk.Toplevel(self._root)
-        win.title("Install required"); win.configure(bg=BG)
-        win.geometry("520x280"); win.resizable(False, False)
-        tk.Label(win, text="🔊  One Package Needed",
-                 bg=BG, fg=C_YELLOW,
-                 font=("Segoe UI", 12, "bold")).pack(pady=(18, 6))
-        msg = ("Run this in your terminal, then restart:\n\n"
-               "    pip install pyaudiowpatch\n\n"
-               "Then click  🔊 System Audio  and play your YouTube video.\n"
-               "No Stereo Mix or VB-Cable needed.")
-        tk.Label(win, text=msg, bg=BG, fg=C_WHITE,
-                 font=("Courier New", 10),
-                 justify=tk.LEFT, padx=24).pack(fill=tk.BOTH, expand=True)
-        tk.Button(win, text="OK", command=win.destroy,
-                  bg=C_BLUE, fg=BG, font=("Segoe UI", 9, "bold"),
-                  relief=tk.FLAT, padx=20, pady=6,
-                  cursor="hand2").pack(pady=(0, 16))
+        # Build Morse symbol string for display
+        morse_parts = []
+        for ch in text:
+            if ch == " ":
+                morse_parts.append("/")
+            else:
+                morse_parts.append(TEXT_TO_MORSE.get(ch.upper(), "?"))
+        self._morse_var.set("  ".join(morse_parts[-12:]))
 
-    # ── lifecycle ─────────────────────────────────────────────────────────────
+        # Update letter tiles (last MAX_TILES decoded chars)
+        display_chars = [c for c in text if c.strip()][-MAX_TILES:]
+        for i, td in enumerate(self._tiles):
+            if i < len(display_chars):
+                ch = display_chars[i].upper()
+                td["letter"]["text"] = ch
+                td["morse"]["text"]  = TEXT_TO_MORSE.get(ch, "")
+            else:
+                td["letter"]["text"] = ""
+                td["morse"]["text"]  = ""
 
-    def _on_close(self):
-        self._stop(); self._root.destroy()
+        # Accumulate decoded text: find overlap between what was shown before
+        # and what the new decode produced, then extend rather than replace.
+        new_text = text.strip()
+        if not new_text:
+            return
+        prev = self._full_text.strip()
+        if not prev:
+            self._full_text = new_text
+        elif new_text.startswith(prev):
+            # New result is a direct extension of previous — keep growing
+            self._full_text = new_text
+        elif prev.endswith(new_text) or prev == new_text:
+            # No new content yet — skip redraw
+            return
+        else:
+            # Find longest suffix of prev that is a prefix of new_text
+            max_ov = min(len(prev), len(new_text))
+            overlap = 0
+            for k in range(max_ov, 0, -1):
+                if prev[-k:] == new_text[:k]:
+                    overlap = k
+                    break
+            if overlap > 0:
+                self._full_text = prev + new_text[overlap:]
+            else:
+                # Completely new content (e.g. new file) — append with separator
+                self._full_text = (prev + "  " + new_text) if prev else new_text
 
-    def run(self):
+        self._text_box.configure(state=tk.NORMAL)
+        self._text_box.delete("1.0", tk.END)
+        self._text_box.insert(tk.END, self._full_text)
+        self._text_box.see(tk.END)
+        self._text_box.configure(state=tk.DISABLED)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Live plot update
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _update_plots(self, data: np.ndarray, engine: MorseEngine) -> None:
+        """Redraw all five matplotlib panels with fresh data."""
+        # Normalise for display
+        raw_f = data.astype(np.float32)
+        peak  = np.max(np.abs(raw_f)) or 1.0
+        norm  = raw_f / peak
+        disp  = norm[:int(BUFFER_SECONDS * SAMPLE_RATE)]
+        sr    = SAMPLE_RATE
+
+        # ── Panel 1: Oscilloscope ─────────────────────────────────────────────
+        ax = self._axes["wave"]
+        ax.cla()
+        ax.set_facecolor(PANEL_BG)
+        t = np.linspace(0, len(disp) / sr, len(disp))
+        ax.plot(t, disp, color=ACCENT, linewidth=0.35, alpha=0.9)
+        ax.set_title("① Oscilloscope  (Raw Waveform)",
+                     color=WHITE, fontsize=8, loc="left", pad=3)
+        ax.set_xlim(0, t[-1]); ax.set_ylim(-1.15, 1.15)
+        ax.tick_params(colors=LABEL_COL, labelsize=7)
+        ax.set_xlabel("Time (s)", color=LABEL_COL, fontsize=7)
+        ax.grid(True, color=GREY, linewidth=0.3, alpha=0.4)
+        for sp in ax.spines.values(): sp.set_color(GREY)
+
+        # ── Panel 2: FFT Spectrum ─────────────────────────────────────────────
+        ax = self._axes["fft"]
+        ax.cla()
+        ax.set_facecolor(PANEL_BG)
+        win  = np.hanning(len(disp))
+        mags = np.abs(np.fft.rfft(disp * win))
+        freq = np.fft.rfftfreq(len(disp), d=1.0 / sr)
+        mask = (freq >= 200) & (freq <= 1500)
+        f_, m_ = freq[mask], mags[mask]
+        ax.fill_between(f_, m_, color=ORANGE, alpha=0.45, linewidth=0)
+        ax.plot(f_, m_, color=ORANGE, linewidth=0.8)
+        if len(m_):
+            pk = f_[np.argmax(m_)]
+            ax.axvline(pk, color=YELLOW, linewidth=1.2, linestyle="--", alpha=0.9)
+            ax.text(pk + 20, m_[np.argmax(m_)] * 0.8,
+                    f"{pk:.0f} Hz", color=YELLOW, fontsize=7)
+        ax.set_title("② FFT Spectrum  (Frequency Domain)",
+                     color=WHITE, fontsize=8, loc="left", pad=3)
+        ax.set_xlim(200, 1500)
+        ax.tick_params(colors=LABEL_COL, labelsize=7)
+        ax.set_xlabel("Frequency (Hz)", color=LABEL_COL, fontsize=7)
+        ax.grid(True, color=GREY, linewidth=0.3, alpha=0.4)
+        for sp in ax.spines.values(): sp.set_color(GREY)
+
+        # ── Panel 3: Waterfall ────────────────────────────────────────────────
+        ax = self._axes["wfall"]
+        ax.cla()
+        ax.set_facecolor(PANEL_BG)
+        nperseg  = min(256, max(32, len(disp) // 60))
+        noverlap = nperseg * 3 // 4
+        try:
+            f_, t_, Sxx = scipy_spectrogram(disp, fs=sr,
+                                            nperseg=nperseg, noverlap=noverlap)
+            Sxx_db = 10 * np.log10(Sxx + 1e-12)
+            fm = (f_ >= 200) & (f_ <= 1500)
+            if np.any(fm) and len(t_) > 1:
+                z    = Sxx_db[fm]
+                vmin = float(np.percentile(z, 8))
+                vmax = float(np.percentile(z, 99))
+                if vmax <= vmin:
+                    vmax = vmin + 1.0
+                ax.pcolormesh(f_[fm], t_, z.T,
+                              shading="auto", cmap="inferno",
+                              vmin=vmin, vmax=vmax)
+                cf = engine.detected_freq
+                ax.axvline(cf, color=YELLOW, linewidth=1.0, linestyle="--", alpha=0.8)
+                ax.text(cf + 15, t_[-1] * 0.01,
+                        f"{cf:.0f} Hz", color=YELLOW, fontsize=7, ha="left", va="top")
+        except Exception as exc:
+            print(f"[UI] Waterfall error: {exc}")
+        ax.set_title("③ Waterfall / Spectrogram  —  Morse = bright stripe",
+                     color=WHITE, fontsize=8, loc="left", pad=3)
+        ax.tick_params(colors=LABEL_COL, labelsize=7)
+        ax.set_xlabel("Frequency (Hz)", color=LABEL_COL, fontsize=7)
+        ax.set_ylabel("Time (s)",       color=LABEL_COL, fontsize=7)
+        for sp in ax.spines.values(): sp.set_color(GREY)
+
+        # ── Panel 4: Binary Signal ────────────────────────────────────────────
+        ax = self._axes["bin"]
+        ax.cla()
+        ax.set_facecolor(PANEL_BG)
+        env    = engine.data
+        win    = max(1, int(sr * 0.005))
+        smooth = np.convolve(env, np.ones(win) / win, mode="same")
+        lo     = np.percentile(smooth, 5)
+        hi     = np.percentile(smooth, 95)
+        binary = (smooth > lo + (hi - lo) * 0.45).astype(np.int8)
+        tb     = np.linspace(0, len(binary) / sr, len(binary))
+        ax.fill_between(tb, binary.astype(float),
+                        step="pre", color=CYAN, alpha=0.75, linewidth=0)
+        ax.step(tb, binary.astype(float),
+                color=CYAN, linewidth=0.6, where="pre")
+        ax.set_title("④ Binary Signal  (ON = Dit or Dah)",
+                     color=WHITE, fontsize=8, loc="left", pad=3)
+        ax.set_xlim(0, tb[-1]); ax.set_ylim(-0.15, 1.25)
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(["OFF", "ON"], color=LABEL_COL, fontsize=7)
+        ax.tick_params(colors=LABEL_COL, labelsize=7)
+        ax.grid(True, axis="x", color=GREY, linewidth=0.3, alpha=0.4)
+        for sp in ax.spines.values(): sp.set_color(GREY)
+
+        # ── Panel 5: Dit / Dah histogram ─────────────────────────────────────
+        ax = self._axes["hist"]
+        ax.cla()
+        ax.set_facecolor(PANEL_BG)
+        changes = np.diff(binary.astype(int))
+        idx     = np.concatenate(([0], np.where(changes != 0)[0] + 1, [len(binary)]))
+        segs    = [(int(binary[idx[i]]), int(idx[i+1] - idx[i]))
+                   for i in range(len(idx) - 1)]
+        on_durs = [d for s, d in segs if s == 1 and d > 0]
+        if on_durs:
+            on_arr = np.array(sorted(on_durs))
+            med    = float(np.median(on_arr))
+            dits_s = [d for d in on_durs if d < med]
+            unit   = float(np.mean(dits_s)) if dits_s else med / 2.0
+            ms     = 1000.0 / sr
+            dits   = [d * ms for s, d in segs if s == 1 and d < unit * 2]
+            dahs   = [d * ms for s, d in segs if s == 1 and d >= unit * 2]
+            spaces = [d * ms for s, d in segs if s == 0 and d >= unit * 0.5]
+            all_v  = dits + dahs + spaces
+            if all_v:
+                bins = np.linspace(0, min(max(all_v), unit * 12 * ms), 30)
+                if dits:
+                    ax.hist(dits,   bins=bins, color=ACCENT,    alpha=0.80,
+                            label=f"Dits ({len(dits)})",    edgecolor="none")
+                if dahs:
+                    ax.hist(dahs,   bins=bins, color=RED_COL,   alpha=0.80,
+                            label=f"Dahs ({len(dahs)})",    edgecolor="none")
+                if spaces:
+                    ax.hist(spaces, bins=bins, color=BLUE_COL,  alpha=0.55,
+                            label=f"Spaces ({len(spaces)})", edgecolor="none")
+                ax.axvline(unit * 2 * ms, color=YELLOW,
+                           linewidth=1.1, linestyle="--", alpha=0.9)
+                ax.legend(fontsize=7, facecolor="#1A1A2E",
+                          edgecolor=GREY, labelcolor=WHITE, loc="upper right")
+        ax.set_title("⑤ Dit / Dah / Space Durations",
+                     color=WHITE, fontsize=8, loc="left", pad=3)
+        ax.tick_params(colors=LABEL_COL, labelsize=7)
+        ax.set_xlabel("Duration (ms)", color=LABEL_COL, fontsize=7)
+        ax.set_ylabel("Count",         color=LABEL_COL, fontsize=7)
+        ax.grid(True, axis="y", color=GREY, linewidth=0.3, alpha=0.4)
+        for sp in ax.spines.values(): sp.set_color(GREY)
+
+        self._canvas.draw_idle()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Entry point
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        """Start the Tkinter main loop."""
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._root.mainloop()
 
-
-if __name__ == "__main__":
-    DecoderUI(sys.argv[1] if len(sys.argv) > 1 else None).run()
+    def _on_close(self) -> None:
+        self._stop()
+        self._root.destroy()

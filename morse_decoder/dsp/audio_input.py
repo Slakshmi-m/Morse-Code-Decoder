@@ -213,12 +213,32 @@ class AudioInput:
     # Mode 3 — WAV file
     # ──────────────────────────────────────────────────────────────────────────
 
-    def stream_file(self, path: str, realtime: bool = False) -> None:
-        """Stream a WAV file chunk-by-chunk (blocking)."""
+    @staticmethod
+    def _load_mp3(path: str) -> tuple[np.ndarray, int]:
+        """Load an MP3 file → (int16 numpy array, sample_rate)."""
         try:
-            fs, raw = wavfile.read(path)
+            from pydub import AudioSegment
+        except ImportError:
+            raise RuntimeError(
+                "pydub is required for MP3 support.\n"
+                "Install with:  pip install pydub\n"
+                "Also install ffmpeg: https://ffmpeg.org/download.html"
+            )
+        seg     = AudioSegment.from_mp3(path).set_channels(1)
+        samples = np.array(seg.get_array_of_samples(), dtype=np.int16)
+        return samples, seg.frame_rate
+
+    def stream_file(self, path: str, realtime: bool = False) -> None:
+        """Stream a WAV or MP3 file chunk-by-chunk (blocking)."""
+        try:
+            if path.lower().endswith(".mp3"):
+                raw, fs = self._load_mp3(path)
+            else:
+                fs, raw = wavfile.read(path)
         except Exception as exc:
             print(f"[AudioInput] Cannot read '{path}': {exc}")
+            if callable(self._on_error):
+                self._on_error(str(exc))
             return
 
         if raw.ndim > 1:
