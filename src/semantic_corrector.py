@@ -60,6 +60,7 @@ class SemanticCorrector:
         morse_symbols: str,
         on_result: Callable[[str], None],
         on_error:  Callable[[str], None],
+        snr_db: float = 0.0,
     ) -> None:
         """
         Non-blocking.  Calls ``on_result(corrected)`` or ``on_error(msg)``
@@ -74,7 +75,7 @@ class SemanticCorrector:
 
         threading.Thread(
             target=self._run,
-            args=(decoded_text, morse_symbols, on_result, on_error),
+            args=(decoded_text, morse_symbols, on_result, on_error, snr_db),
             daemon=True,
         ).start()
 
@@ -86,6 +87,7 @@ class SemanticCorrector:
         morse_symbols: str,
         on_result: Callable[[str], None],
         on_error:  Callable[[str], None],
+        snr_db: float = 0.0,
     ) -> None:
         try:
             # Fast pre-check: is Ollama up and is our model pulled?
@@ -96,7 +98,7 @@ class SemanticCorrector:
 
             payload = json.dumps({
                 "model":  self.model,
-                "prompt": self._build_prompt(decoded_text, morse_symbols),
+                "prompt": self._build_prompt(decoded_text, morse_symbols, snr_db),
                 "stream": False,
                 "options": {
                     "temperature": 0.05,   # near-deterministic
@@ -168,33 +170,59 @@ class SemanticCorrector:
         return None  # model is ready
 
     @staticmethod
-    def _build_prompt(decoded_text: str, morse_symbols: str) -> str:
+    def _build_prompt(decoded_text: str, morse_symbols: str, snr_db: float = 0.0) -> str:
+        if snr_db >= 28:
+            quality_note = (
+                "The signal quality is good. The decoded text is usually correct; "
+                "only rarely does audio noise cause a single character to be misread."
+            )
+            reconstruction_guidance = (
+                "  • Make the minimum number of changes — prefer single-character "
+                "substitutions only when you are certain a character is wrong.\n"
+            )
+        elif snr_db >= 20:
+            quality_note = (
+                "The signal quality is moderate. Audio noise may have caused several "
+                "characters to be misread."
+            )
+            reconstruction_guidance = (
+                "  • Correct characters that are clearly wrong given the dot/dash "
+                "pattern and surrounding context.\n"
+            )
+        else:
+            quality_note = (
+                "The signal quality is poor — significant noise is present. "
+                "Multiple characters are likely wrong."
+            )
+            reconstruction_guidance = (
+                "  • Think like a person reading a garbled telegram: use the Morse "
+                "patterns AND your knowledge of English, Bible verses, and amateur "
+                "radio to reconstruct what was most probably transmitted.  You may "
+                "correct as many characters as needed.\n"
+            )
+
         return (
-            "You are a Morse code expert assistant.\n\n"
-            "An audio Morse code signal was decoded automatically. "
-            "The decoded text is usually correct; only rarely does audio noise "
-            "cause a single character to be misread.\n\n"
-            "Detected Morse dot/dash patterns (from the audio signal):\n"
+            f"You are a human translator receiving a Morse code telegram that may have "
+            f"been garbled by noise. {quality_note}\n\n"
+            "Morse dot/dash patterns detected from the audio:\n"
             f"  {morse_symbols}\n\n"
-            "Automated decode result:\n"
+            "Automated decode:\n"
             f"  {decoded_text}\n\n"
-            "The transmission is likely one of:\n"
-            "  • Amateur radio (CQ calls, RST signal reports, callsigns like W1ABC, "
-            "Q-codes such as QSL / QTH / QRZ, 73, de)\n"
-            "  • Plain English text (e.g. a Bible verse, general message, "
-            "sentence, or phrase)\n"
-            "  • Numbers, abbreviations, or a mix of the above\n\n"
-            "Rules (follow strictly):\n"
-            "  1. Output ONLY the text — no explanation, no preamble, "
-            "no trailing commentary.\n"
-            "  2. Preserve word spacing and any numbers exactly.\n"
-            "  3. Use ALL CAPS (Morse decodes to uppercase).\n"
-            "  4. CRITICAL: If the decoded text already looks correct — valid words, "
-            "callsigns, Q-codes, abbreviations, or numbers — return it EXACTLY "
-            "unchanged, character for character.  Do NOT rephrase, summarise, "
-            "or creatively reinterpret.\n"
-            "  5. Only change a character when you are certain it is wrong based on "
-            "the dot/dash pattern AND surrounding context.  Make the minimum number "
-            "of single-character substitutions necessary — never more than two.\n\n"
+            "The message is likely English prose, a Bible verse, or amateur radio "
+            "(callsigns, Q-codes like QSL/QTH/QRZ, abbreviations like 73/CQ/de).\n\n"
+            "Your job:\n"
+            "  • Read the decoded text as a whole.\n"
+            "  • If it reads as clear, correct English or a recognised radio phrase — "
+            "return it exactly as written, unchanged.\n"
+            "  • If it is garbled or makes no sense — interpret what was most likely "
+            "meant, using the dot/dash patterns and your knowledge of English and "
+            f"amateur radio as your guide.  {reconstruction_guidance.strip()}\n\n"
+            "Two hard limits (never break these):\n"
+            "  1. Do not make any word longer than it appears in the decoded text.  "
+            "'TANT' → 'WANT' is fine (same length).  "
+            "'TANT' → 'TANTOUCH' is wrong (you added characters).\n"
+            "  2. Do not add new words.  Your output must contain the same number of "
+            "words as the decoded text, or fewer — never more.\n\n"
+            "Output ONLY the final text, in ALL CAPS, no explanation.\n\n"
             "Corrected text:"
         )

@@ -499,6 +499,7 @@ class DecoderUI:
         self._plotter      = None
         self._file         = initial_file
         self._llm_after_id = None
+        self._last_snr     = 0.0
         self._semantic     = SemanticCorrector()
 
         self._build_root()
@@ -777,6 +778,7 @@ class DecoderUI:
             self._set_status("Decode error")
 
     def _update_status_bar(self, snr, freq, wpm):
+        self._last_snr = snr
         # SNR meter bar (0–50 dB range)
         pct = min(1.0, max(0.0, (snr - 10) / 40.0))
         bar_w = int(80 * pct)
@@ -794,18 +796,20 @@ class DecoderUI:
 
     # ── text display ──────────────────────────────────────────────────────────
 
-    def _show_text(self, decoded: str):
-        # letter tiles
+    def _update_text_displays(self, decoded: str, syms: str):
         self._tiles.update_text(decoded)
-
-        # full text area
         self._text_area.config(state=tk.NORMAL)
         self._text_area.delete("1.0", tk.END)
         self._text_area.insert(tk.END, decoded)
         self._text_area.see(tk.END)
         self._text_area.config(state=tk.DISABLED)
+        self._morse_area.config(state=tk.NORMAL)
+        self._morse_area.delete("1.0", tk.END)
+        self._morse_area.insert(tk.END, syms)
+        self._morse_area.see(tk.END)
+        self._morse_area.config(state=tk.DISABLED)
 
-        # morse symbols
+    def _show_text(self, decoded: str):
         try:
             syms = "  ".join(
                 TEXT_TO_MORSE.get(c, "?") if c != " " else "/"
@@ -813,11 +817,7 @@ class DecoderUI:
             )
         except Exception:
             syms = decoded
-        self._morse_area.config(state=tk.NORMAL)
-        self._morse_area.delete("1.0", tk.END)
-        self._morse_area.insert(tk.END, syms)
-        self._morse_area.see(tk.END)
-        self._morse_area.config(state=tk.DISABLED)
+        self._update_text_displays(decoded, syms)
 
         # LLM verification debounce — fire 2.5 s after text stops changing
         if self._llm_after_id is not None:
@@ -841,27 +841,39 @@ class DecoderUI:
                     TEXT_TO_MORSE.get(c, "?") if c != " " else "/"
                     for c in decoded
                 )
+                self._update_text_displays(decoded, morse_syms)
 
         self._show_llm_status("Checking with LLM…", C_YELLOW)
 
-        dsp_text = decoded  # capture for closure
+        dsp_text  = decoded
+        snr       = self._last_snr
+        # Strict threshold for clean signals (DSP is reliable);
+        # progressively looser for weak/noisy ones (DSP may be badly wrong).
+        threshold = 0.75 if snr >= 28 else 0.65 if snr >= 20 else 0.50
 
         def _on_llm_result(llm_text: str) -> None:
             ratio = difflib.SequenceMatcher(
                 None, dsp_text.upper(), llm_text.upper()
             ).ratio()
-            if ratio < 0.75:
-                self._q.put((
-                    "llm_status",
-                    f"LLM output too different from DSP decode "
-                    f"(similarity {ratio:.0%}) — DSP result is more reliable here.",
-                ))
+            if ratio < threshold:
+                if snr >= 28:
+                    # DSP is reliable at high SNR — show its result rather than
+                    # a confusing rejection message.
+                    self._q.put(("llm_verified", dsp_text))
+                else:
+                    self._q.put((
+                        "llm_status",
+                        f"LLM output too different from DSP decode "
+                        f"(similarity {ratio:.0%}, threshold {threshold:.0%} at SNR {snr:.0f} dB) "
+                        f"— DSP result is more reliable here.",
+                    ))
             else:
                 self._q.put(("llm_verified", llm_text))
 
         self._semantic.verify_async(
             decoded,
             morse_syms,
+            snr_db   = snr,
             on_result=_on_llm_result,
             on_error= lambda m: self._q.put(("llm_status",   m)),
         )
